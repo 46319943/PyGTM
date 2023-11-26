@@ -8,8 +8,8 @@ np.random.seed(10)
 
 
 def init_model_param(topic_count, vocab_size):
-    mu = np.zeros(topic_count - 1)
-    sigma = np.eye(topic_count - 1)
+    mu = np.zeros(topic_count)
+    sigma = np.eye(topic_count)
     beta = 0.001 + np.random.uniform(0, 1, (topic_count, vocab_size))
     for i in range(topic_count):
         beta[i] /= sum(beta[i])
@@ -21,7 +21,6 @@ def var_param(topic_count, document_size):
     zeta = 10
     lam = np.zeros(topic_count)
     nu2 = np.ones(topic_count)
-    nu2[-1] = 0.0
 
     phi = np.ones((document_size, topic_count)) * (1 / topic_count)
     return zeta, phi, lam, nu2
@@ -29,7 +28,7 @@ def var_param(topic_count, document_size):
 
 def entropy(doc, var):
     zeta, phi, lam, nu2 = var
-    term1 = .5 * sum(np.log(nu2[:-1] + np.log(2 * np.pi) + 1))
+    term1 = .5 * sum(np.log(nu2 + np.log(2 * np.pi) + 1))
     term2 = sum(np.dot(phi[n], np.log(phi[n])) for n, word in enumerate(doc))
 
     return term1 - term2
@@ -42,8 +41,8 @@ def lhood_bnd(doc, var, mod):
     mu, sigma_inv, log_beta = mod
 
     topic_count = len(nu2)
-    diff = lam[:-1] - mu
-    nu2_diag = np.diag(nu2[:-1])
+    diff = lam - mu
+    nu2_diag = np.diag(nu2)
 
     term1 = 0.5 * np.log(det(sigma_inv))
     term2 = 0.5 * topic_count * np.log(2 * np.pi)
@@ -51,13 +50,13 @@ def lhood_bnd(doc, var, mod):
     term3 = 0.5 * (np.trace(np.dot(nu2_diag, sigma_inv)) + np.dot(np.dot(diff.T, sigma_inv), diff))
     log_p_eta = term1 - term2 - term3
 
-    term2 = (1 / zeta) * sum(np.exp(lam[:-1] + nu2[:-1] / 2))
+    term2 = (1 / zeta) * sum(np.exp(lam + nu2 / 2))
     term3 = 1 - np.log(zeta)
     log_p_zn = len(doc) * (-term2 + term3)
 
     log_p_wn = 0
     for n, word in enumerate(doc):
-        term1 = np.dot(lam[:-1], phi[n][:-1])
+        term1 = np.dot(lam, phi[n])
         log_p_zn += (term1)
 
         log_p_wn += np.dot(phi[n], log_beta[:, word])
@@ -70,7 +69,7 @@ def df_lam(doc, var, mod):
     mu, sigma_inv, log_beta = mod
 
     diff = lam.copy()
-    diff[:-1] -= mu
+    diff -= mu
 
     term1 = np.zeros((len(diff), len(diff)))
     term1[0:len(diff) - 1, 0:len(diff) - 1] = sigma_inv
@@ -272,14 +271,14 @@ def maximization(corpus, corpus_var, vocab_size):
         phis.append(phi)
 
     mu_sum = sum(lams)
-    mu = mu_sum[:-1] / len(corpus)
+    mu = mu_sum / len(corpus)
 
-    sigma_sum = sum(np.diag(nu2[:-1]) + np.outer(lam[:-1] - mu, lam[:-1] - mu) for lam, nu2 in zip(lams, nu2s))
+    sigma_sum = sum(np.diag(nu2) + np.outer(lam - mu, lam - mu) for lam, nu2 in zip(lams, nu2s))
     sigma = sigma_sum / len(corpus)
     sigma_inv = np.linalg.inv(sigma)
     # sigma_inv = np.eye(len(mu))
 
-    topic_count = len(mu) + 1
+    topic_count = len(mu)
 
     beta_ss = np.zeros((topic_count, vocab_size))
     for doc, phi in zip(corpus, phis):
