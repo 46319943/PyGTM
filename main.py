@@ -177,14 +177,14 @@ class GTM():
         lam = self.lam[document_index]
         nu2 = self.nu2[document_index]
         zeta = self.zeta[document_index]
-        phi = self.phi[document_index]
+        omega = self.omega[self.locations[document_index]]
 
         sigma_inv = self.sigma_inv[self.locations[document_index]]
-        lam_minus_phi = lam - phi
+        lam_minus_omega = lam - omega
 
-        term1 = np.dot(sigma_inv, lam_minus_phi)
+        term1 = np.dot(sigma_inv, lam_minus_omega)
 
-        term2 = np.sum(phi, axis=0)
+        term2 = np.sum(omega, axis=0)
 
         N = self.word_counts[document_index]
         term3 = (N / zeta) * (np.exp(lam + nu2 / 2))
@@ -205,7 +205,7 @@ class GTM():
 
     def df_nu2(self, document_index, nu2):
         N = self.word_counts[document_index]
-        sigma_inv = self.sigma_inv[document_index]
+        sigma_inv = self.sigma_inv[self.locations[document_index]]
         zeta = self.zeta[document_index]
         lam = self.lam[document_index]
 
@@ -234,7 +234,7 @@ class GTM():
         df1 = np.ones(self.topic_count)
 
         while np.all(np.abs(df1) > 0.0001):
-            if np.isnan(x):
+            if np.any(np.isnan(x)):
                 init_x = init_x * 10
                 x = init_x
                 log_x = np.log(x)
@@ -448,9 +448,7 @@ def main():
     dictionary.save_as_text('dictionary.txt')
 
     # Create a corpus from the documents
-    corpus = [dictionary.doc2bow(doc) for doc in documents]
-
-    # TODO: Corpus format adjustment.
+    corpus = [dictionary.doc2idx(doc) for doc in documents]
 
     # Save the corpus
     dictionary.save_as_text('corpus.txt')
