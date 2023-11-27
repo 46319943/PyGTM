@@ -87,12 +87,12 @@ class GTM():
         self.word_counts = [len(doc) for doc in corpus]
         self.init_variational_factor()
 
-        after = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+        after = self.lhood_bnd_total()
         for _ in range(max_iter):
             before = after
             self.expectation()
             self.maximization()
-            after = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+            after = self.lhood_bnd_total()
 
             print('lhood = ', after)
             print(((before - after) / before))
@@ -164,50 +164,57 @@ class GTM():
 
         return log_p_eta + log_p_wn + log_p_zn + self.entropy_per_document(document_index)
 
-    def lhood_bnd_per_location(self, location_index, omega=None):
-        if omega is None:
-            omega = self.omega[location_index]
-        psi2_diag = np.diag(self.psi2[location_index])
-
-        sigma_inv = self.sigma_inv[location_index]
-        log_beta = np.log(self.beta)
+    def lhood_bnd_total(self, omega_v=None):
+        if omega_v is not None:
+            omega_v = omega_v.reshape((self.location_count, self.topic_count))
+            omegas = omega_v
+        else:
+            omegas = self.omega
 
         log_p_sum_doc = 0
-        document_indices = np.nonzero(self.locations == location_index)[0]
-        for document_index in document_indices:
 
-            zeta = self.zeta[document_index]
-            phi = self.phi[document_index]
-            lam = self.lam[document_index]
-            nu2 = self.nu2[document_index]
-            nu2_diag = np.diag(nu2)
+        for location_index in range(self.location_count):
+            omega = omegas[location_index]
+            psi2_diag = np.diag(self.psi2[location_index])
 
-            topic_count = self.topic_count
-            lam_minus_omega = lam - omega
+            sigma_inv = self.sigma_inv[location_index]
+            log_beta = np.log(self.beta)
 
-            term1 = 0.5 * np.log(det(sigma_inv))
-            term2 = 0.5 * topic_count * np.log(2 * np.pi)
-            term3 = 0.5 * (np.trace(np.dot(nu2_diag, sigma_inv)) + np.trace(np.dot(psi2_diag, sigma_inv)) + np.dot(np.dot(lam_minus_omega.T, sigma_inv), lam_minus_omega))
-            log_p_eta = term1 - term2 - term3
+            document_indices = np.nonzero(self.locations == location_index)[0]
+            for document_index in document_indices:
 
-            term2 = (1 / zeta) * sum(np.exp(lam + nu2 / 2))
-            term3 = 1 - np.log(zeta)
-            log_p_zn = self.word_counts[document_index] * (-term2 + term3)
+                zeta = self.zeta[document_index]
+                phi = self.phi[document_index]
+                lam = self.lam[document_index]
+                nu2 = self.nu2[document_index]
+                nu2_diag = np.diag(nu2)
 
-            log_p_wn = 0
-            for n, word in enumerate(self.corpus[document_index]):
-                term1 = np.dot(lam, phi[n])
-                log_p_zn += term1
+                topic_count = self.topic_count
+                lam_minus_omega = lam - omega
 
-                log_p_wn += np.dot(phi[n], log_beta[:, word])
+                term1 = 0.5 * np.log(det(sigma_inv))
+                term2 = 0.5 * topic_count * np.log(2 * np.pi)
+                term3 = 0.5 * (np.trace(np.dot(nu2_diag, sigma_inv)) + np.trace(np.dot(psi2_diag, sigma_inv)) + np.dot(np.dot(lam_minus_omega.T, sigma_inv), lam_minus_omega))
+                log_p_eta = term1 - term2 - term3
 
-            log_p_sum_doc += log_p_eta + log_p_wn + log_p_zn
+                term2 = (1 / zeta) * sum(np.exp(lam + nu2 / 2))
+                term3 = 1 - np.log(zeta)
+                log_p_zn = self.word_counts[document_index] * (-term2 + term3)
+
+                log_p_wn = 0
+                for n, word in enumerate(self.corpus[document_index]):
+                    term1 = np.dot(lam, phi[n])
+                    log_p_zn += term1
+
+                    log_p_wn += np.dot(phi[n], log_beta[:, word])
+
+                log_p_sum_doc += log_p_eta + log_p_wn + log_p_zn
 
         # Calculate the log_p_mu
         log_p_mu = 0
         for i in range(self.topic_count):
             psi2 = self.psi2[:, i]
-            diff = self.omega[:, i] - self.m
+            diff = omegas[:, i] - self.m
 
             term1 = 0.5 * np.log(self.weight_matrix_inv_det)
             term2 = 0.5 * self.location_count * np.log(2 * np.pi)
@@ -215,7 +222,7 @@ class GTM():
                 np.dot(diff.T, self.weight_matrix_inv), diff))
             log_p_mu += term1 - term2 - term3
 
-        return log_p_sum_doc + log_p_mu + self.entropy_per_location(location_index)
+        return log_p_sum_doc + log_p_mu + sum([self.entropy_per_location(location_index) for location_index in range(self.location_count)])
 
     def df_lam(self, document_index, lam):
         nu2 = self.nu2[document_index]
@@ -359,13 +366,18 @@ class GTM():
     def opt_omega(self):
         omega = self.omega.flatten()
 
-        fn = lambda x: - np.sum([
-            self.lhood_bnd_per_location(location_index, x[location_index, location_index + self.topic_count])
-            for location_index in range(self.location_count)
-        ])
-        g = lambda x: - self.df_omega(x).flatten()
+        # fn = lambda x: - np.sum([
+        #     self.lhood_bnd_per_location(location_index, x[location_index: location_index + self.topic_count])
+        #     for location_index in range(self.location_count)
+        # ])
+        fn = lambda x: - self.lhood_bnd_total(x)
+        g = lambda x: - self.df_omega(x).flatten() * 0.0001
 
+        res = minimize(fn, x0=omega, jac=g, method='Newton-CG', tol=1e-2, options={'disp': 0})
         res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
+        res = minimize(fn, x0=omega, jac=g, method='BFGS', options={'disp': 0})
+        res = minimize(fn, x0=omega, jac=g, method='Nelder-Mead', options={'disp': 0})
+        res = minimize(fn, x0=omega, jac=g, method='L-BFGS-B', options={'disp': 0})
         omega_optimized = res.x
 
         self.omega = omega_optimized.reshape((self.location_count, self.topic_count))
@@ -421,7 +433,7 @@ class GTM():
 
     def expectation(self, max_iter=1):
         for i in range(max_iter):
-            lhood_old = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+            lhood_old = self.lhood_bnd_total()
 
             for document_index in range(self.document_size):
                 self.opt_zeta(document_index)
@@ -435,7 +447,7 @@ class GTM():
             self.opt_omega()
             self.opt_psi2()
 
-            lhood = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+            lhood = self.lhood_bnd_total()
 
             if ((lhood_old - lhood) / lhood_old) < 1e-6:
                 break
