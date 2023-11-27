@@ -214,15 +214,54 @@ class GTM():
         log_p_mu = 0
         for i in range(self.topic_count):
             psi2 = self.psi2[:, i]
-            diff = omegas[:, i] - self.m
+            omega_minus_m = omegas[:, i] - self.m
 
             term1 = 0.5 * np.log(self.weight_matrix_inv_det)
             term2 = 0.5 * self.location_count * np.log(2 * np.pi)
             term3 = 0.5 * (np.trace(np.dot(np.diag(psi2), self.weight_matrix_inv)) + np.dot(
-                np.dot(diff.T, self.weight_matrix_inv), diff))
+                np.dot(omega_minus_m.T, self.weight_matrix_inv), omega_minus_m))
             log_p_mu += term1 - term2 - term3
 
         return log_p_sum_doc + log_p_mu + sum([self.entropy_per_location(location_index) for location_index in range(self.location_count)])
+
+
+    def lhood_bnd_involved_omega(self, omega_v):
+        if omega_v.size == 1:
+            omega_single = omega_v
+            omega_v = self.omega
+            omega_v[0, 0] = omega_single
+
+        omega_v = omega_v.reshape((self.location_count, self.topic_count))
+        omegas = omega_v
+
+        log_p_doc = 0
+
+        for document_index in range(self.document_size):
+            location_index = self.locations[document_index]
+            omega = omegas[location_index]
+            lam = self.lam[document_index]
+
+            sigma_inv = self.sigma_inv[location_index]
+            lam_minus_omega = lam - omega
+
+            term3 = 0.5 * np.dot(np.dot(lam_minus_omega.T, sigma_inv), lam_minus_omega)
+
+            log_p_doc += -term3
+
+        log_p_topic = 0
+
+        for topic_index in range(self.topic_count):
+            omega = omegas[:, topic_index]
+            weight_matrix_inv = self.weight_matrix_inv
+            m = self.m
+
+            omega_minus_m = omega - m
+
+            term3 = 0.5 * np.dot(np.dot(omega_minus_m.T, weight_matrix_inv), omega_minus_m)
+
+            log_p_topic += -term3
+
+        return log_p_doc + log_p_topic
 
     def df_lam(self, document_index, lam):
         nu2 = self.nu2[document_index]
@@ -337,6 +376,11 @@ class GTM():
         self.phi[document_index] = phi
 
     def df_omega(self, omega_v):
+        if omega_v.size == 1:
+            omega_single = omega_v
+            omega_v = self.omega
+            omega_v[0, 0] = omega_single
+
         omega_v = omega_v.reshape((self.location_count, self.topic_count))
         omega_d = np.zeros((self.location_count, self.topic_count))
 
@@ -359,9 +403,9 @@ class GTM():
 
             term2 = np.dot(weight_matrix_inv, omega - m)
 
-            omega_d[:, topic_index] += term2
+            omega_d[:, topic_index] += -term2
 
-        return -omega_d
+        return omega_d
 
     def opt_omega(self):
         omega = self.omega.flatten()
@@ -370,17 +414,29 @@ class GTM():
         #     self.lhood_bnd_per_location(location_index, x[location_index: location_index + self.topic_count])
         #     for location_index in range(self.location_count)
         # ])
-        fn = lambda x: - self.lhood_bnd_total(x)
+        # fn = lambda x: - self.lhood_bnd_total(x)
+        # fn = lambda x: - self.lhood_bnd_involved_omega(x)
+        fn = lambda x: - self.lhood_bnd_involved_omega(x)
+        # g = lambda x: - self.df_omega(x).flatten()
         g = lambda x: - self.df_omega(x).flatten() * 0.0001
+        # g = lambda x: - self.df_omega(x).flatten()[0] * 0.0001
 
+        # res = minimize(fn, x0=omega[0], jac=g, method='Newton-CG', tol=1e-2, options={'disp': 0})
         res = minimize(fn, x0=omega, jac=g, method='Newton-CG', tol=1e-2, options={'disp': 0})
-        res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
-        res = minimize(fn, x0=omega, jac=g, method='BFGS', options={'disp': 0})
-        res = minimize(fn, x0=omega, jac=g, method='Nelder-Mead', options={'disp': 0})
-        res = minimize(fn, x0=omega, jac=g, method='L-BFGS-B', options={'disp': 0})
+        # res = minimize(fn, x0=omega, jac=g, method='CG', tol=5e-3, options={'disp': 0})
+        # res = minimize(fn, x0=omega, jac=g, method='CG', tol=1e-2, options={'disp': 0})
+        # res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
+        # res = minimize(fn, x0=omega[0], jac=g, method='BFGS', options={'disp': 0})
+        # res = minimize(fn, x0=omega, jac=g, method='Nelder-Mead', options={'disp': 0})
+        # res = minimize(fn, x0=omega, jac=g, method='L-BFGS-B', options={'disp': 0})
         omega_optimized = res.x
 
         self.omega = omega_optimized.reshape((self.location_count, self.topic_count))
+
+
+    def df_omega_single(self):
+        pass
+
 
     def df_psi2(self, psi2):
         psi2_d = np.zeros((self.location_count, self.topic_count))
