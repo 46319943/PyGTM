@@ -1,10 +1,13 @@
-import numpy as np
-from numpy.linalg import det
-from numpy.linalg import inv
-from scipy.optimize import minimize
+import json
 import os
 from os import path
+
+import numpy as np
+from numpy.linalg import det
+from scipy.optimize import minimize
+
 from gensim.corpora import Dictionary
+from scipy.spatial.distance import pdist, squareform
 
 np.random.seed(10)
 
@@ -63,8 +66,7 @@ class GTM():
         self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
 
     def init_variational_factor(self):
-        self.zeta = np.empty(self.document_size)
-        self.zeta = 10
+        self.zeta = np.ones(self.document_size) * 10
 
         self.lam = np.zeros((self.document_size, self.topic_count))
         self.nu2 = np.ones((self.document_size, self.topic_count))
@@ -85,13 +87,22 @@ class GTM():
         self.word_counts = [len(doc) for doc in corpus]
         self.init_variational_factor()
 
+        after = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
         for _ in range(max_iter):
-            self.expectation(corpus, locations)
-            self.maximization(corpus, locations)
+            before = after
+            self.expectation()
+            self.maximization()
+            after = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+
+            print('lhood = ', after)
+            print(((before - after) / before))
+            if ((before - after) / before) < 0.001:
+                break
+
 
     def entropy_per_location(self, location_index):
         # Calculate the entropy of the document belonging to the location
-        document_indices = np.nonzero(self.locations == location_index)
+        document_indices = np.nonzero(self.locations == location_index)[0]
         document_entropy = 0
         for document_index in document_indices:
             nu2 = self.nu2[document_index]
@@ -102,7 +113,7 @@ class GTM():
 
             document_entropy += term1 - term2
 
-        document_entropy = sum(self.entropy_per_document(document_index) for document_index in document_indices)
+        # document_entropy = sum(self.entropy_per_document(document_index) for document_index in document_indices)
 
         # Calculate the entropy of the location
         psi2 = self.psi2[location_index]
@@ -118,7 +129,7 @@ class GTM():
         log_beta = np.log(self.beta)
 
         log_p_sum_doc = 0
-        document_indices = np.nonzero(self.locations == location_index)
+        document_indices = np.nonzero(self.locations == location_index)[0]
         for document_index in document_indices:
 
             zeta = self.zeta[document_index]
@@ -192,32 +203,29 @@ class GTM():
 
         self.lam[document_index] = lam_optimized
 
-
-    def df_nu2(self, document_index):
+    def df_nu2(self, document_index, nu2):
         N = self.word_counts[document_index]
         sigma_inv = self.sigma_inv[document_index]
         zeta = self.zeta[document_index]
         lam = self.lam[document_index]
-        nu2 = self.nu2[document_index]
 
         term1 = 0.5 * np.diag(sigma_inv)
         term2 = 0.5 * (N / zeta) * np.exp(lam + nu2 / 2)
         term3 = 1 / (2 * nu2)
         return -term1 - term2 + term3
 
-    def df2_nu2(self, document_index):
+    def df2_nu2(self, document_index, nu2):
         N = self.word_counts[document_index]
         zeta = self.zeta[document_index]
         lam = self.lam[document_index]
-        nu2 = self.nu2[document_index]
 
         term1 = 0.25 * (N / zeta) * np.exp(lam + nu2 / 2)
         term2 = 0.5 * (1 / (nu2 * nu2))
         return -term1 - term2
 
     def opt_nu2(self, document_index):
-        g = lambda _: self.df_nu2(document_index)
-        h = lambda _: self.df2_nu2(document_index)
+        g = lambda x: self.df_nu2(document_index, x)
+        h = lambda x: self.df2_nu2(document_index, x)
 
         init_x = np.ones(self.topic_count) * 10
         x = init_x
@@ -239,7 +247,6 @@ class GTM():
 
         self.nu2[document_index] = np.exp(log_x)
 
-
     def opt_zeta(self, document_index):
         lam = self.lam[document_index]
         nu2 = self.nu2[document_index]
@@ -247,7 +254,7 @@ class GTM():
 
     def log_sum(self, log_a, log_b):
         """
-        Explain it's fu
+        Explain its functionality
         """
         if log_a < log_b:
             return log_b + np.log(1 + np.exp(log_a - log_b))
@@ -277,162 +284,198 @@ class GTM():
 
         self.phi[document_index] = phi
 
-    def df_omega(self, location_index):
-        pass
+    def df_omega(self):
+        omega_d = np.zeros((self.location_count, self.topic_count))
 
-    def opt_omega(self, location_index):
-        pass
+        for location_index in range(self.location_count):
+            omega = self.omega[location_index]
+            sigma_inv = self.sigma_inv[location_index]
 
+            term1 = 0
+            for document_index in np.nonzero(self.locations == location_index)[0]:
+                lam = self.lam[document_index]
+                lam_minus_omega = lam - omega
+                term1 += np.dot(sigma_inv, lam_minus_omega)
 
-    def inference(self, doc, mod):
-        mu, sigma_inv, log_beta = mod
+            omega_d[location_index] += term1
 
-        topic_count = len(log_beta)
-        document_size = len(doc)
-        var = self.init_variational_factor(topic_count, document_size)
-        zeta, phi, lam, nu2 = var
+        for topic_index in range(self.topic_count):
+            omega = self.omega[:, topic_index]
+            weight_matrix_inv = self.weight_matrix_inv
+            m = self.m
 
-        for i in range(20):
-            var = zeta, phi, lam, nu2
-            lhood_old = self.lhood_bnd_per_location(doc, var, mod)
-            # print ('lhood_old = ', lhood_old)
+            term2 = np.dot(weight_matrix_inv, omega - m)
 
-            var = zeta, phi, lam, nu2
-            zeta = self.opt_zeta(doc, var, mod)
+            omega_d[:, topic_index] += term2
 
-            var = zeta, phi, lam, nu2
-            # print (lhood_bnd(doc, var, mod))
+        return -omega_d
 
-            var = zeta, phi, lam, nu2
-            lam = self.opt_lam(doc, var, mod)
-            lam[-1] = 0
+    def opt_omega(self):
+        omega = self.omega.flatten()
 
-            var = zeta, phi, lam, nu2
-            # print (lhood_bnd(doc, var, mod))
+        fn = lambda x: - np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+        g = lambda x: - self.df_omega().flatten()
 
-            var = zeta, phi, lam, nu2
-            zeta = self.opt_zeta(doc, var, mod)
+        res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
+        omega_optimized = res.x
 
-            var = zeta, phi, lam, nu2
-            # print (lhood_bnd(doc, var, mod))
+        self.omega = omega_optimized.reshape((self.location_count, self.topic_count))
 
-            var = zeta, phi, lam, nu2
-            nu2 = self.opt_nu2(doc, var, mod)
+    def df_psi2(self, psi2):
+        psi2_d = np.zeros((self.location_count, self.topic_count))
 
-            var = zeta, phi, lam, nu2
-            # print (lhood_bnd(doc, var, mod))
+        for location_index in range(self.location_count):
+            sigma_inv = self.sigma_inv[location_index]
+            term1 = 0.5 * np.diag(sigma_inv)
+            psi2_d[location_index] += term1
 
-            var = zeta, phi, lam, nu2
-            zeta = self.opt_zeta(doc, var, mod)
+        for topic_index in range(self.topic_count):
+            weight_matrix_inv = self.weight_matrix_inv
+            term2 = 0.5 * np.diag(weight_matrix_inv)
+            psi2_d[:, topic_index] += term2
 
-            var = zeta, phi, lam, nu2
-            # print (lhood_bnd(doc, var, mod))
+        psi2_d = -psi2_d
 
-            var = zeta, phi, lam, nu2
-            phi = self.opt_phi(doc, var, mod)
+        psi2 = psi2.reshape((self.location_count, self.topic_count))
+        term3 = 1 / (2 * psi2)
+        psi2_d += term3
 
-            var = zeta, phi, lam, nu2
-            zeta = self.opt_zeta(doc, var, mod)
+        return psi2_d
 
-            var = zeta, phi, lam, nu2
-            # print (lhood_bnd(doc, var, mod))
+    def df2_psi2(self, psi2):
+        psi2 = psi2.reshape((self.location_count, self.topic_count))
+        return - 0.5 * (1 / (psi2 * psi2))
 
-            var = zeta, phi, lam, nu2
-            lhood = self.lhood_bnd_per_location(doc, var, mod)
+    def opt_psi2(self):
+        g = lambda _: self.df_psi2().flatten()
+        h = lambda _: self.df2_psi2().flatten()
+
+        init_x = np.ones((self.location_count, self.topic_count)).flatten() * 10
+        x = init_x
+
+        log_x = np.log(x)
+        df1 = np.ones((self.location_count, self.topic_count)).flatten()
+
+        while np.all(np.abs(df1) > 0.0001):
+            if np.isnan(x):
+                init_x = init_x * 10
+                x = init_x
+                log_x = np.log(x)
+            x = np.exp(log_x)
+
+            df1 = g(x)
+            df2 = h(x)
+
+            log_x -= (x * df1) / (x * x * df2 + x * df1)
+
+        self.psi2 = np.exp(log_x).reshape((self.location_count, self.topic_count))
+
+    def expectation(self, max_iter=1000):
+        for i in range(max_iter):
+            lhood_old = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+
+            for document_index in range(self.document_size):
+                self.opt_zeta(document_index)
+                self.opt_lam(document_index)
+                self.opt_zeta(document_index)
+                self.opt_nu2(document_index)
+                self.opt_zeta(document_index)
+                self.opt_phi(document_index)
+                self.opt_zeta(document_index)
+
+            self.opt_omega()
+            self.opt_psi2()
+
+            lhood = np.sum([self.lhood_bnd_per_location(location_index) for location_index in range(self.location_count)])
+
             if ((lhood_old - lhood) / lhood_old) < 1e-6:
                 break
-            # print ('-lhood = ', lhood)
 
             lhood_old = lhood
 
-        return zeta, phi, lam, nu2
+    def maximization(self):
+        self.m = np.sum(self.omega, axis=-1) / self.topic_count
 
-    def expectation(self, corpus, mod):
-        corpus_var = []
-        for d, doc in enumerate(corpus):
-            var = self.inference(doc, mod)
-            zeta, phi, lam, nu2 = var
-            corpus_var.append((zeta, phi.copy(), lam.copy(), nu2.copy()))
-        return corpus_var
+        for location_index in range(self.location_count):
+            N = np.sum(self.locations == location_index)
+            nu2 = self.nu2[self.locations == location_index]
+            lams = self.lam[self.locations == location_index]
+            omega = self.omega[location_index]
 
-    def maximization(self, corpus, corpus_var, vocab_size):
-        lams = []
-        nu2s = []
-        phis = []
-        for zeta, phi, lam, nu2 in corpus_var:
-            lams.append(lam)
-            nu2s.append(nu2)
-            phis.append(phi)
+            term1 = np.diag(np.sum(nu2, axis=0))
 
-        mu_sum = sum(lams)
-        mu = mu_sum / len(corpus)
+            term2 = 0
+            for lam in lams:
+                lam_minus_omega = lam - omega
+                term2 += np.outer(lam_minus_omega, lam_minus_omega)
 
-        sigma_sum = sum(np.diag(nu2) + np.outer(lam - mu, lam - mu) for lam, nu2 in zip(lams, nu2s))
-        sigma = sigma_sum / len(corpus)
-        sigma_inv = np.linalg.inv(sigma)
-        # sigma_inv = np.eye(len(mu))
+            self.sigma[location_index] = (term1 + term2) / N
+            self.sigma_inv[location_index] = np.linalg.inv(self.sigma[location_index])
+            self.sigma_inv_det[location_index] = np.linalg.det(self.sigma_inv[location_index])
 
-        topic_count = len(mu)
+        corpus = self.corpus
+        phis = self.phi
 
-        beta_ss = np.zeros((topic_count, vocab_size))
+        beta_ss = np.zeros((self.topic_count, self.vocab_size))
         for doc, phi in zip(corpus, phis):
-            for i in range(topic_count):
+            for i in range(self.topic_count):
                 for n, word in enumerate(doc):
                     beta_ss[i, word] += phi[n, i]
 
-        log_beta = np.zeros((topic_count, vocab_size))
-        for i in range(topic_count):
+        log_beta = np.zeros((self.topic_count, self.vocab_size))
+        for i in range(self.topic_count):
             sum_term = sum(beta_ss[i])
 
             if sum_term == 0:
-                sum_term = (-1000) * vocab_size
+                sum_term = (-1000) * self.vocab_size
                 print(sum_term)
             else:
                 sum_term = np.log(sum_term)
 
-            for j in range(vocab_size):
+            for j in range(self.vocab_size):
                 log_beta[i, j] = np.log(beta_ss[i, j]) - sum_term
-        # print (np.exp(log_beta))
-        return mu, sigma_inv, log_beta
+
+        self.beta = np.exp(log_beta)
+        self.log_beta = log_beta
 
 
 def main():
-    text = []
-    filenames = []
-    for file in sorted((fname for fname in os.listdir('20newsgroups') if not fname.endswith('.csv')), key=int):
-        if file.endswith('csv'):
-            continue
-        filenames.append(file)
-        file = open(path.join('20newsgroups', file), 'r')
-        text.append(file.read().split())
+    # Load the "suzhou_sense_for_gtm.json"
+    documents = json.load(open('suzhou_sense_for_gtm.json', 'r', encoding='UTF-8'))
 
-    words = sorted(set(sum(text, [])))
-    documents = []
-    for row in text:
-        documents.append([words.index(word) for word in row])
+    # Create a dictionary from the documents
+    dictionary = Dictionary(documents)
+    dictionary.save_as_text('dictionary.txt')
 
-    open('words.txt', 'w').write(' '.join(words))
+    # Create a corpus from the documents
+    corpus = [dictionary.doc2bow(doc) for doc in documents]
 
-    topic_count = 20
-    mod = init_model_param(topic_count, len(words))
-    # mu, sigma_inv, log_beta = mod
+    # TODO: Corpus format adjustment.
 
-    after = sum(lhood_bnd(doc, self.init_variational_factor(topic_count, len(doc)), mod) for doc in documents)
-    print('init ', after)
-    for _ in range(1000):
-        before = after
-        corpus_var = expectation(documents, mod)
-        mod = maximization(documents, corpus_var, len(words))
+    # Save the corpus
+    dictionary.save_as_text('corpus.txt')
 
-        after = sum(lhood_bnd(doc, var, mod) for doc, var in zip(documents, corpus_var))
-        print('lhood = ', after)
-        print(((before - after) / before))
-        if ((before - after) / before) < 0.001:
-            break
-    mu, sigma_inv, log_beta = mod
-    np.savetxt('beta.txt', np.exp(log_beta))
-    corpus_lam = np.array([lam for zeta, phi, lam, nu2 in corpus_var])
-    np.savetxt('corpus-lam.txt', corpus_lam)
+    location_count = 5
+
+    # Generate a random location for each document
+    locations = np.random.randint(0, location_count, len(documents))
+
+    # Generate a random coordinate for each location
+    coords = np.random.uniform(0, 1, (location_count, 2))
+
+    # Calculate the distance matrix using the coordinates and pdist
+    distance_matrix = squareform(pdist(coords))
+
+    # Calculate the weight matrix using the distance matrix and gaussian kernel
+    weight_matrix = np.exp(-distance_matrix ** 2)
+
+
+    # Initialize the GTM model
+    gtm = GTM(10, len(dictionary), location_count, weight_matrix)
+
+    # Train the GTM model
+    gtm.train(corpus, locations)
+
 
 
 if __name__ == '__main__':
