@@ -1,11 +1,10 @@
 import json
 
-import numba
 import numpy as np
-from numba import int32, float32
-from numba.typed import List
-from numba.experimental import jitclass
 from numpy.linalg import det
+from numba.experimental import jitclass
+from numba import types, typed
+
 from scipy.optimize import minimize
 
 from gensim.corpora import Dictionary
@@ -14,35 +13,30 @@ from scipy.spatial.distance import pdist, squareform
 np.random.seed(10)
 
 
-spec = [
-    ('topic_count', int32),
-    ('vocab_size', int32),
-    ('location_count', int32),
-    ('weight_matrix', float32[:, :]),
-    ('weight_matrix_inv', float32[:, :]),
-    ('weight_matrix_inv_det', float32),
-    ('m', float32[:]),
-    ('sigma', float32[:, :, :]),
-    ('sigma_inv', float32[:, :, :]),
-    ('sigma_inv_det', float32[:]),
-    ('beta', float32[:, :]),
-    ('log_beta', float32[:, :]),
-    ('corpus', int32[:, :]),
-    ('locations', int32[:]),
-    ('document_size', int32),
-    ('word_counts', int32[:]),
-    # ('phi', List.empty_list(float32[:, :])),
-    ('phi', numba.types.ListType(numba.types.Array(dtype=numba.float32, ndim=2, layout='A'))),
-    ('zeta', float32[:]),
-    ('lam', float32[:, :]),
-    ('nu2', float32[:, :]),
-    ('omega', float32[:, :]),
-    ('psi2', float32[:, :]),
-]
-
-
-@jitclass(spec)
+@jitclass()
 class GTM:
+    topic_count: types.int32
+    vocab_size: types.int32
+    location_count: types.int32
+    weight_matrix: types.float32[:, :]
+    weight_matrix_inv: types.float32[:, :]
+    weight_matrix_inv_det: types.float32
+    m: types.float32[:]
+    sigma: types.float32[:, :, :]
+    sigma_inv: types.float32[:, :, :]
+    sigma_inv_det: types.float32[:]
+    beta: types.float32[:, :]
+    log_beta: types.float32[:, :]
+    corpus: types.ListType(types.int32[::1])
+    locations: types.int32[:]
+    document_size: types.int32
+    word_counts: types.int32[:]
+    phi: types.ListType(types.float32[:, :])
+    zeta: types.float32[:]
+    lam: types.float32[:, :]
+    nu2: types.float32[:, :]
+    omega: types.float32[:, :]
+    psi2: types.float32[:, :]
 
     def __init__(self, topic_count, vocab_size, location_count, weight_matrix):
         # Model Property
@@ -52,40 +46,40 @@ class GTM:
 
         # Model parameter
         self.weight_matrix = weight_matrix
-        self.weight_matrix_inv = None
-        self.weight_matrix_inv_det = None
-        self.m = None
-        self.sigma = None
-        self.sigma_inv = None
-        self.sigma_inv_det = None
-        self.beta = None
-        self.log_beta = None
+        self.weight_matrix_inv = np.empty((0, 0), dtype=np.float32)
+        self.weight_matrix_inv_det = np.float32(0)
+        self.m = np.empty((0,), dtype=np.float32)
+        self.sigma = np.empty((0, 0, 0), dtype=np.float32)
+        self.sigma_inv = np.empty((0, 0, 0), dtype=np.float32)
+        self.sigma_inv_det = np.empty((0,), dtype=np.float32)
+        self.beta = np.empty((0, 0), dtype=np.float32)
+        self.log_beta = np.empty((0, 0), dtype=np.float32)
 
         # Training parameters
-        self.corpus = None
-        self.locations = None
-        self.document_size = None
-        self.word_counts = None
+        self.corpus = typed.List.empty_list(types.int32[::1])
+        self.locations = np.empty((0, ), dtype=np.int32)
+        self.document_size = 0
+        self.word_counts = np.empty((0, ), dtype=np.int32)
 
         # Variational factors
-        self.phi = None
-        self.zeta = None
-        self.lam = None
-        self.nu2 = None
-        self.omega = None
-        self.psi2 = None
+        self.phi = typed.List.empty_list(types.float32[:, :])
+        self.zeta = np.empty((0, ), dtype=np.float32)
+        self.lam = np.empty((0, 0), dtype=np.float32)
+        self.nu2 = np.empty((0, 0), dtype=np.float32)
+        self.omega = np.empty((0, 0), dtype=np.float32)
+        self.psi2 = np.empty((0, 0), dtype=np.float32)
 
         self.init_model_param()
 
     def init_model_param(self):
         # Size(location_count)
-        self.m = np.zeros(self.location_count)
+        self.m = np.zeros(self.location_count, dtype=np.float32)
         # Size(location_count, topic_count, topic_count)
-        self.sigma = np.tile(np.eye(self.topic_count), (self.location_count, 1, 1))
+        self.sigma = np.eye(self.topic_count, dtype=np.float32).repeat(self.location_count).reshape((self.location_count, self.topic_count, self.topic_count))
         self.sigma_inv = self.sigma
-        self.sigma_inv_det = np.ones(self.location_count)
+        self.sigma_inv_det = np.ones(self.location_count, dtype=np.float32)
         # Size(topic_count, vocab_size)
-        self.beta = 0.001 + np.random.uniform(0, 1, (self.topic_count, self.vocab_size))
+        self.beta = np.float32(0.001) + np.random.uniform(0, 1, (self.topic_count, self.vocab_size)).astype(np.float32)
         self.log_beta = np.log(self.beta)
 
         # for i in range(self.topic_count):
@@ -96,19 +90,20 @@ class GTM:
         self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
 
     def init_variational_factor(self):
-        self.zeta = np.ones(self.document_size) * 10
+        self.zeta = np.ones(self.document_size, dtype=np.float32) * 10
 
-        self.lam = np.zeros((self.document_size, self.topic_count))
-        self.nu2 = np.ones((self.document_size, self.topic_count))
+        self.lam = np.zeros((self.document_size, self.topic_count), dtype=np.float32)
+        self.nu2 = np.ones((self.document_size, self.topic_count), dtype=np.float32)
 
-        self.omega = np.zeros((self.location_count, self.topic_count))
-        self.psi2 = np.ones((self.location_count, self.topic_count))
+        self.omega = np.zeros((self.location_count, self.topic_count), dtype=np.float32)
+        self.psi2 = np.ones((self.location_count, self.topic_count), dtype=np.float32)
 
         # The size of phi is dependent on the words count in each document
-        self.phi = [None] * self.document_size
-        phi_init_value = 1 / self.topic_count
+        phi_init_value = np.float32(1 / self.topic_count)
         for i in range(self.document_size):
-            self.phi[i] = np.ones((self.word_counts[i], self.topic_count)) * phi_init_value
+            self.phi.append(
+                np.ones((self.word_counts[i], self.topic_count), dtype=np.float32) * phi_init_value
+            )
 
     def train(self, corpus, locations, max_iter=1000):
         self.corpus = corpus
@@ -584,7 +579,7 @@ def main():
     weight_matrix = np.exp(-distance_matrix ** 2)
 
     # Initialize the GTM model
-    gtm = GTM(10, len(dictionary), location_count, weight_matrix)
+    gtm = GTM(10, len(dictionary), location_count, np.float32(weight_matrix))
 
     # Train the GTM model
     gtm.train(corpus, locations)
