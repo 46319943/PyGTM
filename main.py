@@ -12,7 +12,7 @@ from scipy.spatial.distance import pdist, squareform
 np.random.seed(10)
 
 
-class GTM():
+class GTM:
 
     def __init__(self, topic_count, vocab_size, location_count, weight_matrix):
         # Model Property
@@ -53,7 +53,7 @@ class GTM():
         # Size(location_count, topic_count, topic_count)
         self.sigma = np.tile(np.eye(self.topic_count), (self.location_count, 1, 1))
         self.sigma_inv = self.sigma
-        self.sigma_inv_det = np.ones((self.location_count))
+        self.sigma_inv_det = np.ones(self.location_count)
         # Size(topic_count, vocab_size)
         self.beta = 0.001 + np.random.uniform(0, 1, (self.topic_count, self.vocab_size))
         self.log_beta = np.log(self.beta)
@@ -129,7 +129,6 @@ class GTM():
         term = .5 * sum(np.log(psi2) + np.log(2 * np.pi) + 1)
 
         return document_entropy + term
-
 
     def lhood_bnd_per_document(self, document_index, lam=None):
         omega = self.omega[self.locations[document_index]]
@@ -224,13 +223,7 @@ class GTM():
 
         return log_p_sum_doc + log_p_mu + sum([self.entropy_per_location(location_index) for location_index in range(self.location_count)])
 
-
     def lhood_bnd_involved_omega(self, omega_v):
-        if omega_v.size == 1:
-            omega_single = omega_v
-            omega_v = self.omega
-            omega_v[0, 0] = omega_single
-
         omega_v = omega_v.reshape((self.location_count, self.topic_count))
         omegas = omega_v
 
@@ -315,8 +308,8 @@ class GTM():
         return -term1 - term2
 
     def opt_nu2(self, document_index):
-        g = lambda x: self.df_nu2(document_index, x)
-        h = lambda x: self.df2_nu2(document_index, x)
+        g = lambda nu2: self.df_nu2(document_index, nu2)
+        h = lambda nu2: self.df2_nu2(document_index, nu2)
 
         init_x = np.ones(self.topic_count) * 10
         x = init_x
@@ -410,33 +403,13 @@ class GTM():
     def opt_omega(self):
         omega = self.omega.flatten()
 
-        # fn = lambda x: - np.sum([
-        #     self.lhood_bnd_per_location(location_index, x[location_index: location_index + self.topic_count])
-        #     for location_index in range(self.location_count)
-        # ])
-        # fn = lambda x: - self.lhood_bnd_total(x)
-        # fn = lambda x: - self.lhood_bnd_involved_omega(x)
         fn = lambda x: - self.lhood_bnd_involved_omega(x)
-        # g = lambda x: - self.df_omega(x).flatten()
-        g = lambda x: - self.df_omega(x).flatten() * 0.0001
-        # g = lambda x: - self.df_omega(x).flatten()[0] * 0.0001
+        g = lambda x: - self.df_omega(x).flatten()
 
-        # res = minimize(fn, x0=omega[0], jac=g, method='Newton-CG', tol=1e-2, options={'disp': 0})
-        res = minimize(fn, x0=omega, jac=g, method='Newton-CG', tol=1e-2, options={'disp': 0})
-        # res = minimize(fn, x0=omega, jac=g, method='CG', tol=5e-3, options={'disp': 0})
-        # res = minimize(fn, x0=omega, jac=g, method='CG', tol=1e-2, options={'disp': 0})
-        # res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
-        # res = minimize(fn, x0=omega[0], jac=g, method='BFGS', options={'disp': 0})
-        # res = minimize(fn, x0=omega, jac=g, method='Nelder-Mead', options={'disp': 0})
-        # res = minimize(fn, x0=omega, jac=g, method='L-BFGS-B', options={'disp': 0})
+        res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
         omega_optimized = res.x
 
         self.omega = omega_optimized.reshape((self.location_count, self.topic_count))
-
-
-    def df_omega_single(self):
-        pass
-
 
     def df_psi2(self, psi2):
         psi2_d = np.zeros((self.location_count, self.topic_count))
@@ -464,8 +437,8 @@ class GTM():
         return - 0.5 * (1 / (psi2 * psi2))
 
     def opt_psi2(self):
-        g = lambda x: self.df_psi2(x).flatten()
-        h = lambda x: self.df2_psi2(x).flatten()
+        g = lambda psi2: self.df_psi2(psi2).flatten()
+        h = lambda psi2: self.df2_psi2(psi2).flatten()
 
         init_x = np.ones((self.location_count, self.topic_count)).flatten() * 10
         x = init_x
@@ -487,10 +460,9 @@ class GTM():
 
         self.psi2 = np.exp(log_x).reshape((self.location_count, self.topic_count))
 
-    def expectation(self, max_iter=1):
+    def expectation(self, max_iter=10):
+        lhood_old = self.lhood_bnd_total()
         for i in range(max_iter):
-            lhood_old = self.lhood_bnd_total()
-
             for document_index in range(self.document_size):
                 self.opt_zeta(document_index)
                 self.opt_phi(document_index)
@@ -504,10 +476,8 @@ class GTM():
             self.opt_psi2()
 
             lhood = self.lhood_bnd_total()
-
             if ((lhood_old - lhood) / lhood_old) < 1e-6:
                 break
-
             lhood_old = lhood
 
     def maximization(self):
@@ -584,7 +554,6 @@ def main():
     # Calculate the weight matrix using the distance matrix and gaussian kernel
     weight_matrix = np.exp(-distance_matrix ** 2)
 
-
     # Initialize the GTM model
     gtm = GTM(10, len(dictionary), location_count, weight_matrix)
 
@@ -602,8 +571,6 @@ def main():
     # Print the topic distribution of each document
     for i in range(len(documents)):
         print(gtm.lam[i].argmax(axis=1))
-
-
 
 
 if __name__ == '__main__':
