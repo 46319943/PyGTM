@@ -1,8 +1,10 @@
 import json
-import os
-from os import path
 
+import numba
 import numpy as np
+from numba import int32, float32
+from numba.typed import List
+from numba.experimental import jitclass
 from numpy.linalg import det
 from scipy.optimize import minimize
 
@@ -12,6 +14,34 @@ from scipy.spatial.distance import pdist, squareform
 np.random.seed(10)
 
 
+spec = [
+    ('topic_count', int32),
+    ('vocab_size', int32),
+    ('location_count', int32),
+    ('weight_matrix', float32[:, :]),
+    ('weight_matrix_inv', float32[:, :]),
+    ('weight_matrix_inv_det', float32),
+    ('m', float32[:]),
+    ('sigma', float32[:, :, :]),
+    ('sigma_inv', float32[:, :, :]),
+    ('sigma_inv_det', float32[:]),
+    ('beta', float32[:, :]),
+    ('log_beta', float32[:, :]),
+    ('corpus', int32[:, :]),
+    ('locations', int32[:]),
+    ('document_size', int32),
+    ('word_counts', int32[:]),
+    # ('phi', List.empty_list(float32[:, :])),
+    ('phi', numba.types.ListType(numba.types.Array(dtype=numba.float32, ndim=2, layout='A'))),
+    ('zeta', float32[:]),
+    ('lam', float32[:, :]),
+    ('nu2', float32[:, :]),
+    ('omega', float32[:, :]),
+    ('psi2', float32[:, :]),
+]
+
+
+@jitclass(spec)
 class GTM:
 
     def __init__(self, topic_count, vocab_size, location_count, weight_matrix):
@@ -278,7 +308,6 @@ class GTM:
         lam = self.lam[document_index]
 
         # TODO: Optimize in batch for all document in a location.
-        # fn = lambda x: -self.lhood_bnd_per_location(self.locations[document_index])
         fn = lambda x: -self.lhood_bnd_per_document(document_index, x)
         g = lambda x: -self.df_lam(document_index, x)
 
