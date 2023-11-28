@@ -143,7 +143,9 @@ class GTM:
             term1 = .5 * sum(np.log(nu2) + np.log(2 * np.pi) + 1)
 
             phi = self.phi[document_index]
-            term2 = sum(np.dot(phi[n], np.log(phi[n])) for n in range(self.word_counts[document_index]))
+            term2 = 0
+            for n in range(self.word_counts[document_index]):
+                term2 += np.dot(phi[n], np.log(phi[n]))
 
             document_entropy += term1 - term2
 
@@ -190,6 +192,9 @@ class GTM:
 
     def lhood_bnd_total(self, omega_v=None):
         if omega_v is not None:
+            # Help numba to infer the type of omega_v
+            if not isinstance(omega_v, np.ndarray):
+                omega_v = np.array(omega_v)
             omega_v = omega_v.reshape((self.location_count, self.topic_count))
             omegas = omega_v
         else:
