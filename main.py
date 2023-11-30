@@ -13,11 +13,11 @@ from scipy.spatial.distance import pdist, squareform
 np.random.seed(10)
 
 
-@njit()
+@njit(parallel=True)
 def entropy_phi(phis):
     D = len(phis)
     term = 0
-    for document_index in range(D):
+    for document_index in prange(D):
         phi = phis[document_index]
         term += np.sum(phi * np.log(phi))
     return -term
@@ -33,13 +33,13 @@ def entropy_psi2(psi2s):
     return 0.5 * np.sum(np.log(psi2s) + np.log(2 * np.pi) + 1)
 
 
-@njit()
+@njit(parallel=True)
 def ELBO_lam(sigma_invs, phis, zetas, lams, nu2s, omegas, locations):
     D = len(phis)
 
     log_p_eta = 0
     log_p_z = 0
-    for document_index in range(D):
+    for document_index in prange(D):
         sigma_inv = sigma_invs[locations[document_index]]
         lam = lams[document_index]
         omega = omegas[locations[document_index]]
@@ -55,21 +55,21 @@ def ELBO_lam(sigma_invs, phis, zetas, lams, nu2s, omegas, locations):
     return log_p_eta + log_p_z
 
 
-@njit()
+@njit(parallel=True)
 def df_lam(sigma_invs, phis, zetas, lams, nu2s, omegas, locations):
     D = len(phis)
     T = lams.shape[1]
 
     term1 = np.zeros((D, T))
     word_counts = np.zeros(D)
-    for document_index in range(D):
+    for document_index in prange(D):
         term1[document_index] = np.sum(phis[document_index], axis=0)
         word_counts[document_index] = len(phis[document_index])
 
     term2 = - (word_counts / zetas)[:, np.newaxis] * np.exp(lams + nu2s / 2)
 
     term3 = np.zeros((D, T))
-    for document_index in range(D):
+    for document_index in prange(D):
         sigma_inv = sigma_invs[locations[document_index]]
         lam = lams[document_index]
         omega = omegas[locations[document_index]]
@@ -79,8 +79,9 @@ def df_lam(sigma_invs, phis, zetas, lams, nu2s, omegas, locations):
 
 
 @njit(parallel=True, fastmath=True)
-def numba_logsumexp_stable(p, out):
+def numba_logsumexp_stable(p):
     n, m = p.shape
+    out = np.empty((n,))
     assert len(out) == n
     assert out.ndim == 1
     assert p.ndim == 2
@@ -93,13 +94,18 @@ def numba_logsumexp_stable(p, out):
         res = np.log(res) + p_max
         out[i] = res
 
-@njit()
+    return out
+
+@njit(parallel=True)
 def opt_phi(log_beta, lams, corpus):
     D = len(lams)
     T = lams.shape[1]
 
     phis = typed.List.empty_list(types.float64[:, ::1])
-    for document_index in range(D):
+    for _ in range(D):
+        phis.append(np.empty((0, 0)))
+
+    for document_index in prange(D):
         lam = lams[document_index]
         N = len(corpus[document_index])
         log_phi = np.zeros((N, T), dtype=np.float64)
@@ -107,38 +113,77 @@ def opt_phi(log_beta, lams, corpus):
         for n, word in enumerate(corpus[document_index]):
             log_phi[n, :] = lam + log_beta[:, word]
 
-        # This code segment about log-sum-exp is optimized using GPT4.
-        # Using NumPy operations for log-sum-exp
-        # max_log_phi = np.max(log_phi, axis=1, keepdims=True)
-        # log_phi_sum = np.log(np.sum(np.exp(log_phi - max_log_phi), axis=1, keepdims=True)) + max_log_phi
-
         # Using Numba operations for log-sum-exp
-        log_phi_sum = np.zeros((N, ), dtype=np.float64)
-        numba_logsumexp_stable(log_phi, log_phi_sum)
-        log_phi_sum = log_phi_sum[:, np.newaxis]
+        log_phi_sum = np.empty((N, 1))
+        log_phi_sum[:, 0] = numba_logsumexp_stable(log_phi)
+
+        # This line cause the process terminated unexpectedly. This should be the bug of numba.
+        # log_phi_sum_ = log_phi_sum[:, np.newaxis]
 
         # Vectorized calculation of phi
         phi = np.exp(log_phi - log_phi_sum)
 
-        phis.append(phi)
+        phis[document_index] = phi
 
     return phis
 
-@njit()
+
+@njit(parallel=True)
+def opt_nu2(sigma_invs, zetas, lams, locations, word_counts):
+    D = len(lams)
+    T = lams.shape[1]
+
+    # Precompute constants and reshape for batch operations
+    sigma_inv_diag = np.zeros((D, T))
+    for document_index in prange(D):
+        sigma_inv_diag[document_index] = np.diag(sigma_invs[locations[document_index]])
+    term1_nu2 = -0.5 * sigma_inv_diag
+
+    # Initialize variables for batch optimization
+    init_x = np.ones((D, T)) * 10
+    x = init_x
+    log_x = np.log(x)
+
+    while True:
+        x = np.exp(log_x)
+
+        # Batch calculations for df_nu2 and df2_nu2
+        term2_nu2 = -0.5 * (word_counts / zetas)[:, np.newaxis] * np.exp(lams + x / 2)
+        term3_nu2 = 1 / (2 * x)
+        df1 = term1_nu2 + term2_nu2 + term3_nu2
+
+        term1_nu2_2 = -0.25 * (word_counts / zetas)[:, np.newaxis] * np.exp(lams + x / 2)
+        term2_nu2_2 = -0.5 * (1 / (x * x))
+        df2 = term1_nu2_2 + term2_nu2_2
+
+        log_x -= (x * df1) / (x * x * df2 + x * df1)
+
+        # Check for convergence and NaN handling
+        if np.all(np.abs(df1) <= 0.0001):
+            break
+        if np.any(np.isnan(x)):
+            init_x *= 10
+            log_x = np.log(init_x)
+
+    return x
+
+
+@njit(parallel=True)
 def log_p_w(log_beta, phis: types.ListType(types.float64[:, ::1]), corpus):
     D = len(phis)
     value = 0
-    for document_index in range(D):
+    for document_index in prange(D):
         phi = phis[document_index]
         for n, word in enumerate(corpus[document_index]):
             value += np.dot(phi[n], log_beta[:, word])
     return value
 
-@njit()
+
+@njit(parallel=True)
 def log_p_z(phis, zetas, lams, nu2s):
     D = len(phis)
     value = 0
-    for document_index in range(D):
+    for document_index in prange(D):
         zeta = zetas[document_index]
         nu2 = nu2s[document_index]
         lam = lams[document_index]
@@ -152,13 +197,14 @@ def log_p_z(phis, zetas, lams, nu2s):
         value += term1 + term2 + term3
     return value
 
-@njit()
+
+@njit(parallel=True)
 def log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations):
     D = len(lams)
     T = lams.shape[1]
 
     value = 0
-    for document_index in range(D):
+    for document_index in prange(D):
         sigma_inv = sigma_invs[locations[document_index]]
         lam = lams[document_index]
         omega = omegas[locations[document_index]]
@@ -176,6 +222,7 @@ def log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations):
         value += term1 - term2 - term3
 
     return value
+
 
 @njit()
 def log_p_mu(weight_matrix_inv, weight_matrix_inv_det, omegas, psi2s, m):
@@ -199,7 +246,8 @@ def log_p_mu(weight_matrix_inv, weight_matrix_inv_det, omegas, psi2s, m):
 
     return value
 
-# @njit()
+
+@njit()
 def ELBO(
         log_beta, m, sigma_invs, weight_matrix_inv, weight_matrix_inv_det,
         phis, zetas, lams, nu2s, omegas, psi2s, locations, corpus):
@@ -250,18 +298,12 @@ class GTM:
         # Size(location_count)
         self.m = np.zeros(self.location_count, dtype=np.float64)
         # Size(location_count, topic_count, topic_count)
-        # self.sigma = np.eye(self.topic_count, dtype=np.float64).repeat(self.location_count).reshape(
-        #     (self.location_count, self.topic_count, self.topic_count))
         self.sigma = np.tile(np.eye(self.topic_count, dtype=np.float64), (self.location_count, 1, 1))
         self.sigma_inv = self.sigma
         self.sigma_inv_det = np.ones(self.location_count, dtype=np.float64)
         # Size(topic_count, vocab_size)
         self.beta = np.float64(0.001) + np.random.uniform(0, 1, (self.topic_count, self.vocab_size)).astype(np.float64)
-
-        # for i in range(self.topic_count):
-        #     beta[i] /= sum(beta[i])
         self.beta /= np.sum(self.beta, axis=1)[:, np.newaxis]
-
         self.log_beta = np.log(self.beta)
 
         self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
@@ -310,56 +352,25 @@ class GTM:
             if ((before - after) / before) < 0.001:
                 break
 
-    # def lhood_bnd_involved_omega(self, omega_v):
-    #     omega_v = omega_v.reshape((self.location_count, self.topic_count))
-    #     omegas = omega_v
-    #
-    #     log_p_doc = 0
-    #
-    #     for document_index in range(self.document_size):
-    #         location_index = self.locations[document_index]
-    #         omega = omegas[location_index]
-    #         lam = self.lam[document_index]
-    #
-    #         sigma_inv = self.sigma_inv[location_index]
-    #         lam_minus_omega = lam - omega
-    #
-    #         term3 = 0.5 * np.dot(np.dot(lam_minus_omega.T, sigma_inv), lam_minus_omega)
-    #
-    #         log_p_doc += -term3
-    #
-    #     log_p_topic = 0
-    #
-    #     for topic_index in range(self.topic_count):
-    #         omega = omegas[:, topic_index]
-    #         weight_matrix_inv = self.weight_matrix_inv
-    #         m = self.m
-    #
-    #         omega_minus_m = omega - m
-    #
-    #         term3 = 0.5 * np.dot(np.dot(omega_minus_m.T, weight_matrix_inv), omega_minus_m)
-    #
-    #         log_p_topic += -term3
-    #
-    #     return log_p_doc + log_p_topic
+    def lhood_bnd_involved_omega(self, omegas):
+        log_p_doc = 0
+        for location_index in range(self.location_count):
+            lam = self.lam[self.locations == location_index]
+            omega = omegas[location_index]
+            lam_minus_omega = lam - omega
+            sigma_inv = self.sigma_inv[location_index]
 
-    def lhood_bnd_involved_omega(self, omega_v):
-        omega_v = omega_v.reshape((self.location_count, self.topic_count))
+            term3 = 0.5 * np.dot(lam_minus_omega, sigma_inv) * lam_minus_omega
+            log_p_doc += -np.sum(term3)
 
-        # Vectorized computation for the document loop
-        location_indices = self.locations[:self.document_size]
-        lam = self.lam[:self.document_size]
-        omega = omega_v[location_indices]
-        sigma_inv = self.sigma_inv[location_indices]
-        lam_minus_omega = lam - omega
-        # term3_docs = 0.5 * np.einsum('ij,ij->i', lam_minus_omega, np.dot(sigma_inv, lam_minus_omega))
-        term3_docs = 0.5 * np.einsum('ijk,ik->i', sigma_inv, lam_minus_omega)
-        log_p_doc = -np.sum(term3_docs)
+        log_p_topic = 0
 
-        # Vectorized computation for the topic loop
-        omega_minus_m = omega_v - self.m[:, np.newaxis]
-        term3_topics = 0.5 * np.einsum('ij,ij->j', omega_minus_m, np.dot(self.weight_matrix_inv, omega_minus_m))
-        log_p_topic = -np.sum(term3_topics)
+        weight_matrix_inv = self.weight_matrix_inv
+        m = self.m
+        omega_minus_m = omegas - m[:, np.newaxis]
+
+        term3 = 0.5 * np.dot(omega_minus_m.T, weight_matrix_inv).T * omega_minus_m
+        log_p_topic += -np.sum(term3)
 
         return log_p_doc + log_p_topic
 
@@ -375,127 +386,21 @@ class GTM:
 
         self.lam = lam_optimized.reshape((self.document_size, self.topic_count))
 
-    # def df_nu2(self, nu2):
-    #     term1 = 0.5 * np.diag(self.sigma_inv[self.locations])
-    #     term2 = 0.5 * (self.word_counts / self.zeta) * np.exp(self.lam + nu2 / 2)
-    #     term3 = 1 / (2 * nu2)
-    #     return -term1 - term2 + term3
-    #
-    # def df2_nu2(self, nu2):
-    #     term1 = - 0.25 * (self.word_counts / self.zeta) * np.exp(self.lam + nu2 / 2)
-    #     term2 = - 0.5 * (1 / (nu2 * nu2))
-    #     return term1 + term2
-    #
-    # def opt_nu2(self, document_index):
-    #     g = lambda nu2: self.df_nu2(nu2)
-    #     h = lambda nu2: self.df2_nu2(nu2)
-    #
-    #     init_x = np.ones(self.topic_count) * 10
-    #     x = init_x
-    #
-    #     log_x = np.log(x)
-    #     df1 = np.ones(self.topic_count)
-    #
-    #     while np.all(np.abs(df1) > 0.0001):
-    #         if np.any(np.isnan(x)):
-    #             init_x = init_x * 10
-    #             x = init_x
-    #             log_x = np.log(x)
-    #         x = np.exp(log_x)
-    #
-    #         df1 = g(x)
-    #         df2 = h(x)
-    #
-    #         log_x -= (x * df1) / (x * x * df2 + x * df1)
-    #
-    #     self.nu2[document_index] = np.exp(log_x)
-
-    def opt_nu2(self):
-        D = self.document_size
-        T = self.topic_count
-
-        # Precompute constants and reshape for batch operations
-        sigma_inv_diag = 0.5 * np.array([np.diag(self.sigma_inv[self.locations[i]]) for i in range(D)])
-        zeta = self.zeta
-        lam = self.lam
-
-        # Initialize variables for batch optimization
-        init_x = np.ones((D, T)) * 10
-        x = init_x
-        log_x = np.log(x)
-
-        while True:
-            x = np.exp(log_x)
-
-            # Batch calculations for df_nu2 and df2_nu2
-            term2_nu2 = 0.5 * (self.word_counts / zeta)[:, np.newaxis] * np.exp(lam + x / 2)
-            term3_nu2 = 1 / (2 * x)
-            df1 = -(sigma_inv_diag + term2_nu2 - term3_nu2)
-
-            term1_nu2_2 = 0.25 * (self.word_counts / zeta)[:, np.newaxis] * np.exp(lam + x / 2)
-            term2_nu2_2 = 0.5 * (1 / (x * x))
-            df2 = -(term1_nu2_2 + term2_nu2_2)
-
-            log_x -= (x * df1) / (x * x * df2 + x * df1)
-
-            # Check for convergence and NaN handling
-            if np.all(np.abs(df1) <= 0.0001):
-                break
-            if np.any(np.isnan(x)):
-                init_x *= 10
-                log_x = np.log(init_x)
-
-        self.nu2 = x
-
     def opt_zeta(self):
         self.zeta = np.sum(np.exp(self.lam + self.nu2 / 2), axis=-1)
 
-    # def df_omega(self, omega_v):
-    #     if omega_v.size == 1:
-    #         omega_single = omega_v
-    #         omega_v = self.omega
-    #         omega_v[0, 0] = omega_single
-    #
-    #     omega_v = omega_v.reshape((self.location_count, self.topic_count))
-    #     omega_d = np.zeros((self.location_count, self.topic_count))
-    #
-    #     for location_index in range(self.location_count):
-    #         omega = omega_v[location_index]
-    #         sigma_inv = self.sigma_inv[location_index]
-    #
-    #         term1 = 0
-    #         for document_index in np.nonzero(self.locations == location_index)[0]:
-    #             lam = self.lam[document_index]
-    #             lam_minus_omega = lam - omega
-    #             term1 += np.dot(sigma_inv, lam_minus_omega)
-    #
-    #         omega_d[location_index] += term1
-    #
-    #     for topic_index in range(self.topic_count):
-    #         omega = omega_v[:, topic_index]
-    #         weight_matrix_inv = self.weight_matrix_inv
-    #         m = self.m
-    #
-    #         term2 = np.dot(weight_matrix_inv, omega - m)
-    #
-    #         omega_d[:, topic_index] += -term2
-    #
-    #     return omega_d
-
-    def df_omega(self, omega_v):
-        omega_v = omega_v.reshape((self.location_count, self.topic_count))
-
+    def df_omega(self, omega):
         # Vectorized computation for location loop
         omega_d_location = np.zeros((self.location_count, self.topic_count))
         for location_index in range(self.location_count):
             sigma_inv = self.sigma_inv[location_index]
             document_indices = np.nonzero(self.locations == location_index)[0]
             lam = self.lam[document_indices]
-            lam_minus_omega = lam - omega_v[location_index]
+            lam_minus_omega = lam - omega[location_index]
             omega_d_location[location_index] = np.dot(sigma_inv, lam_minus_omega.sum(axis=0))
 
         # Vectorized computation for topic loop
-        omega_minus_m = omega_v - self.m[:, np.newaxis]
+        omega_minus_m = omega - self.m[:, np.newaxis]
         omega_d_topic = -np.dot(self.weight_matrix_inv, omega_minus_m)
 
         return omega_d_location + omega_d_topic
@@ -503,62 +408,13 @@ class GTM:
     def opt_omega(self):
         omega = self.omega.flatten()
 
-        fn = lambda x: - self.lhood_bnd_involved_omega(x)
-        g = lambda x: - self.df_omega(x).flatten()
+        fn = lambda x: - self.lhood_bnd_involved_omega(x.reshape((self.location_count, self.topic_count)))
+        g = lambda x: - self.df_omega(x.reshape((self.location_count, self.topic_count))).flatten()
 
         res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
         omega_optimized = res.x
 
         self.omega = omega_optimized.reshape((self.location_count, self.topic_count))
-
-    # def df_psi2(self, psi2):
-    #     psi2_d = np.zeros((self.location_count, self.topic_count))
-    #
-    #     for location_index in range(self.location_count):
-    #         sigma_inv = self.sigma_inv[location_index]
-    #         term1 = 0.5 * np.diag(sigma_inv)
-    #         psi2_d[location_index] += term1
-    #
-    #     for topic_index in range(self.topic_count):
-    #         weight_matrix_inv = self.weight_matrix_inv
-    #         term2 = 0.5 * np.diag(weight_matrix_inv)
-    #         psi2_d[:, topic_index] += term2
-    #
-    #     psi2_d = -psi2_d
-    #
-    #     psi2 = psi2.reshape((self.location_count, self.topic_count))
-    #     term3 = 1 / (2 * psi2)
-    #     psi2_d += term3
-    #
-    #     return psi2_d
-    #
-    # def df2_psi2(self, psi2):
-    #     psi2 = psi2.reshape((self.location_count, self.topic_count))
-    #     return - 0.5 * (1 / (psi2 * psi2))
-    #
-    # def opt_psi2(self):
-    #     g = lambda psi2: self.df_psi2(psi2).flatten()
-    #     h = lambda psi2: self.df2_psi2(psi2).flatten()
-    #
-    #     init_x = np.ones((self.location_count, self.topic_count)).flatten() * 10
-    #     x = init_x
-    #
-    #     log_x = np.log(x)
-    #     df1 = np.ones((self.location_count, self.topic_count)).flatten()
-    #
-    #     while np.all(np.abs(df1) > 0.0001):
-    #         if np.any(np.isnan(x)):
-    #             init_x = init_x * 10
-    #             x = init_x
-    #             log_x = np.log(x)
-    #         x = np.exp(log_x)
-    #
-    #         df1 = g(x)
-    #         df2 = h(x)
-    #
-    #         log_x -= (x * df1) / (x * x * df2 + x * df1)
-    #
-    #     self.psi2 = np.exp(log_x).reshape((self.location_count, self.topic_count))
 
     def df_psi2(self, psi2):
         term1 = 0.5 * np.diagonal(self.sigma_inv, axis1=1, axis2=2)
@@ -566,21 +422,19 @@ class GTM:
 
         psi2_d = - (term1 + term2[:, np.newaxis])
 
-        psi2 = psi2.reshape((self.location_count, self.topic_count))
         term3 = 1 / (2 * psi2)
         psi2_d += term3
 
         return psi2_d
 
     def df2_psi2(self, psi2):
-        psi2 = psi2.reshape((self.location_count, self.topic_count))
         return -0.5 * (1 / (psi2 * psi2))
 
     def opt_psi2(self):
-        g = lambda psi2: self.df_psi2(psi2).flatten()
-        h = lambda psi2: self.df2_psi2(psi2).flatten()
+        g = lambda psi2: self.df_psi2(psi2)
+        h = lambda psi2: self.df2_psi2(psi2)
 
-        init_x = np.ones((self.location_count, self.topic_count)).flatten() * 10
+        init_x = np.ones((self.location_count, self.topic_count)) * 10
         x = init_x
 
         log_x = np.log(x)
@@ -598,7 +452,7 @@ class GTM:
 
             log_x -= (x * df1) / (x * x * df2 + x * df1)
 
-        self.psi2 = np.exp(log_x).reshape((self.location_count, self.topic_count))
+        self.psi2 = np.exp(log_x)
 
     def expectation(self, max_iter=10):
         lhood_old = ELBO(
@@ -611,7 +465,7 @@ class GTM:
             self.opt_zeta()
             self.opt_lam()
             self.opt_zeta()
-            self.opt_nu2()
+            self.nu2 = opt_nu2(self.sigma_inv, self.zeta, self.lam, self.locations, self.word_counts)
             self.opt_zeta()
 
             self.opt_omega()
