@@ -173,6 +173,7 @@ def df_lam(sigma_invs, phis, zetas, lams, nu2s, omegas, locations):
 
     return term1 + term2 + term3
 
+
 # Parallel makes it slower, as task is too small, overhead spent on parallelization is too large.
 @njit()
 def numba_logsumexp_stable(p):
@@ -271,9 +272,12 @@ def opt_nu2(sigma_invs, zetas, lams, locations, word_counts):
     return x
 
 
-def maximization(lams, nu2s, omegas, locations):
+@njit(parallel=True)
+def maximize_sigmas(lams, nu2s, omegas, locations):
     location_count = len(omegas)
     topic_count = lams.shape[1]
+
+    sigmas = np.zeros((location_count, topic_count, topic_count))
 
     for location_index in prange(location_count):
         N = np.sum(locations == location_index)
@@ -288,24 +292,30 @@ def maximization(lams, nu2s, omegas, locations):
             lam_minus_omega = lam - omega
             term2 += np.outer(lam_minus_omega, lam_minus_omega)
 
-        self.sigma[location_index] = (term1 + term2) / N
-        self.sigma_inv[location_index] = np.linalg.inv(self.sigma[location_index])
-        self.sigma_inv_det[location_index] = np.linalg.det(self.sigma_inv[location_index])
+        sigmas[location_index] = (term1 + term2) / N
 
-    corpus = self.corpus
-    phis = self.phi
+    return sigmas
 
-    beta_ss = np.zeros((self.topic_count, self.vocab_size))
-    for doc, phi in zip(corpus, phis):
-        for n, word in enumerate(doc):
+
+@njit(parallel=True)
+def maximize_beta(phis, corpus, vocab_size):
+    topic_count = phis[0].shape[1]
+
+    beta_ss = np.zeros((topic_count, vocab_size))
+
+    for document_index in prange(len(corpus)):
+        phi = phis[document_index]
+        for n, word in enumerate(corpus[document_index]):
             beta_ss[:, word] += phi[n, :]
 
-    sum_log_term = np.log(np.sum(beta_ss, axis=1))
-    beta_log = np.log(beta_ss)
-    beta_log_normed = np.exp(beta_log - sum_log_term[:, np.newaxis])
+    # Temporal solution for the bug of numba
+    sum_log_term = np.zeros((topic_count, 1))
+    sum_log_term[:, 0] = np.log(np.sum(beta_ss, axis=1))
 
-    self.beta = np.exp(beta_log_normed)
-    self.log_beta = beta_log_normed
+    beta_log = np.log(beta_ss)
+    beta_log_normed = np.exp(beta_log - sum_log_term)
+
+    return np.exp(beta_log_normed), beta_log_normed
 
 
 class GTM:
@@ -530,37 +540,11 @@ class GTM:
     def maximization(self):
         self.m = np.sum(self.omega, axis=-1) / self.topic_count
 
-        for location_index in range(self.location_count):
-            N = np.sum(self.locations == location_index)
-            nu2 = self.nu2[self.locations == location_index]
-            lams = self.lam[self.locations == location_index]
-            omega = self.omega[location_index]
+        self.sigma = maximize_sigmas(self.lam, self.nu2, self.omega, self.locations)
+        self.sigma_inv = np.linalg.inv(self.sigma)
+        self.sigma_inv_det = np.linalg.det(self.sigma_inv)
 
-            term1 = np.diag(np.sum(nu2, axis=0))
-
-            term2 = 0
-            for lam in lams:
-                lam_minus_omega = lam - omega
-                term2 += np.outer(lam_minus_omega, lam_minus_omega)
-
-            self.sigma[location_index] = (term1 + term2) / N
-            self.sigma_inv[location_index] = np.linalg.inv(self.sigma[location_index])
-            self.sigma_inv_det[location_index] = np.linalg.det(self.sigma_inv[location_index])
-
-        corpus = self.corpus
-        phis = self.phi
-
-        beta_ss = np.zeros((self.topic_count, self.vocab_size))
-        for doc, phi in zip(corpus, phis):
-            for n, word in enumerate(doc):
-                beta_ss[:, word] += phi[n, :]
-
-        sum_log_term = np.log(np.sum(beta_ss, axis=1))
-        beta_log = np.log(beta_ss)
-        beta_log_normed = np.exp(beta_log - sum_log_term[:, np.newaxis])
-
-        self.beta = np.exp(beta_log_normed)
-        self.log_beta = beta_log_normed
+        self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
 
     def save(self, path):
         np.savez(
