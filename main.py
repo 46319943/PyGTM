@@ -129,22 +129,22 @@ def ELBO(
 def ELBO_lam(sigma_invs, phis, zetas, lams, nu2s, omegas, locations):
     D = len(phis)
 
-    log_p_eta = 0
-    log_p_z = 0
+    log_p_eta_for_lam = 0
+    log_p_z_for_lam = 0
     for document_index in prange(D):
         sigma_inv = sigma_invs[locations[document_index]]
         lam = lams[document_index]
         omega = omegas[locations[document_index]]
-        log_p_eta += -0.5 * np.dot(np.dot((lam - omega).T, sigma_inv), lam - omega)
+        log_p_eta_for_lam += -0.5 * np.dot(np.dot((lam - omega).T, sigma_inv), lam - omega)
 
         zeta = zetas[document_index]
         nu2 = nu2s[document_index]
         word_count = len(phis[document_index])
         term1 = np.sum(np.dot(lam, phis[document_index].T))
         term2 = - word_count * (1 / zeta) * sum(np.exp(lam + nu2 / 2))
-        log_p_z += term1 + term2
+        log_p_z_for_lam += term1 + term2
 
-    return log_p_eta + log_p_z
+    return log_p_eta_for_lam + log_p_z_for_lam
 
 
 @njit(parallel=True)
@@ -195,7 +195,6 @@ def numba_logsumexp_stable(p):
 
 
 @njit(parallel=True)
-# @njit()
 def opt_phi(log_beta, lams, corpus):
     D = len(lams)
     T = lams.shape[1]
@@ -223,7 +222,6 @@ def opt_phi(log_beta, lams, corpus):
         phi = np.exp(log_phi - log_phi_sum)
 
         phis[document_index] = phi
-        # phis.append(phi)
 
     return phis
 
