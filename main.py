@@ -299,18 +299,22 @@ def maximize_sigmas(lams, nu2s, omegas, locations):
 def maximize_beta(phis, corpus, vocab_size):
     topic_count = phis[0].shape[1]
 
-    beta_ss = np.zeros((topic_count, vocab_size))
+    beta_sum = np.zeros((topic_count, vocab_size))
 
     for document_index in prange(len(corpus)):
         phi = phis[document_index]
+        beta_single = np.zeros((topic_count, vocab_size))
         for n, word in enumerate(corpus[document_index]):
-            beta_ss[:, word] += phi[n, :]
+            # race condition in the execution of the parallel for-loop results in an incorrect return value.
+            beta_single[:, word] += phi[n, :]
+
+        beta_sum += beta_single
 
     # Temporal solution for the bug of numba
     sum_log_term = np.zeros((topic_count, 1))
-    sum_log_term[:, 0] = np.log(np.sum(beta_ss, axis=1))
+    sum_log_term[:, 0] = np.log(np.sum(beta_sum, axis=1))
 
-    beta_log = np.log(beta_ss)
+    beta_log = np.log(beta_sum)
     beta_log_normed = np.exp(beta_log - sum_log_term)
 
     return np.exp(beta_log_normed), beta_log_normed
