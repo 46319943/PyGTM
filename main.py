@@ -594,8 +594,12 @@ def main():
     # Initialize the GTM model
     gtm = GTM(10, len(dictionary), location_count, np.float64(weight_matrix))
 
+    corpus_input = typed.List.empty_list(types.int32[::1])
+    for doc in corpus:
+        corpus_input.append(np.array(doc))
+
     # Train the GTM model
-    gtm.train(typed.List(corpus), locations)
+    gtm.train(corpus_input, locations)
 
 
 if __name__ == '__main__':
