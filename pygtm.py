@@ -1,13 +1,12 @@
 import json
+import pickle
 
 import numpy as np
-from numpy.linalg import det
+from gensim.corpora import Dictionary
 from numba import njit, prange
 from numba import types, typed
-
+from numpy.linalg import det
 from scipy.optimize import minimize
-
-from gensim.corpora import Dictionary
 from scipy.spatial.distance import pdist, squareform
 
 np.random.seed(10)
@@ -279,6 +278,11 @@ def maximize_sigmas(lams, nu2s, omegas, locations):
 
     for location_index in prange(location_count):
         N = np.sum(locations == location_index)
+
+        if N == 0:
+            sigmas[location_index] = np.eye(topic_count)
+            continue
+
         nu2s_location = nu2s[locations == location_index]
         lams_location = lams[locations == location_index]
         omega = omegas[location_index]
@@ -315,7 +319,7 @@ def maximize_beta(phis, corpus, vocab_size):
     sum_log_term[:, 0] = np.log(np.sum(beta_sum, axis=1))
 
     beta_log = np.log(beta_sum)
-    beta_log_normed = np.exp(beta_log - sum_log_term)
+    beta_log_normed = beta_log - sum_log_term
 
     return np.exp(beta_log_normed), beta_log_normed
 
@@ -343,6 +347,7 @@ class GTM:
         self.locations = None
         self.document_size = 0
         self.word_counts = None
+        self.location_document_count = None
 
         # Variational factors
         self.phi = typed.List.empty_list(types.float64[:, ::1])
@@ -385,55 +390,57 @@ class GTM:
                 np.ones((self.word_counts[i], self.topic_count)) * phi_init_value
             )
 
+    def ELBO(self):
+        return ELBO(
+            self.log_beta, self.m, self.sigma_inv, self.weight_matrix_inv, self.weight_matrix_inv_det,
+            self.phi, self.zeta, self.lam, self.nu2, self.omega, self.psi2, self.locations, self.corpus
+        )
+
     def train(self, corpus, locations, max_iter=1000):
         self.corpus = corpus
         self.locations = locations
         self.document_size = len(corpus)
         self.word_counts = np.array([len(doc) for doc in corpus])
+        self.location_document_count = np.array([np.sum(locations == i) for i in range(self.location_count)])
         self.init_variational_factor()
 
-        after = ELBO(
-            self.log_beta, self.m, self.sigma_inv, self.weight_matrix_inv, self.weight_matrix_inv_det,
-            self.phi, self.zeta, self.lam, self.nu2, self.omega, self.psi2, self.locations, self.corpus
-        )
+        after = self.ELBO()
 
         for _ in range(max_iter):
             before = after
             self.expectation()
             self.maximization()
 
-            after = ELBO(
-                self.log_beta, self.m, self.sigma_inv, self.weight_matrix_inv, self.weight_matrix_inv_det,
-                self.phi, self.zeta, self.lam, self.nu2, self.omega, self.psi2, self.locations, self.corpus
-            )
+            after = self.ELBO()
 
             print('lhood = ', after)
             print(((before - after) / before))
-            if ((before - after) / before) < 0.001:
+            if ((before - after) / before) < 1e-4:
                 break
 
-    def expectation(self, max_iter=10):
-        likelihood_old = ELBO(
-            self.log_beta, self.m, self.sigma_inv, self.weight_matrix_inv, self.weight_matrix_inv_det,
-            self.phi, self.zeta, self.lam, self.nu2, self.omega, self.psi2, self.locations, self.corpus
-        )
+    def expectation(self, max_iter=50):
+        likelihood_old = self.ELBO()
+
+        self.opt_psi2()
+        print(self.ELBO())
+
         for i in range(max_iter):
             self.opt_zeta()
             self.phi = opt_phi(self.log_beta, self.lam, self.corpus)
+            print(self.ELBO())
             self.opt_zeta()
             self.opt_lam()
+            print(self.ELBO())
             self.opt_zeta()
             self.nu2 = opt_nu2(self.sigma_inv, self.zeta, self.lam, self.locations, self.word_counts)
+            print(self.ELBO())
             self.opt_zeta()
 
             self.opt_omega()
-            self.opt_psi2()
+            print(self.ELBO())
 
-            likelihood = ELBO(
-                self.log_beta, self.m, self.sigma_inv, self.weight_matrix_inv, self.weight_matrix_inv_det,
-                self.phi, self.zeta, self.lam, self.nu2, self.omega, self.psi2, self.locations, self.corpus
-            )
-            if ((likelihood_old - likelihood) / likelihood_old) < 1e-6:
+            likelihood = self.ELBO()
+            if ((likelihood_old - likelihood) / likelihood_old) < 1e-3:
                 break
             likelihood_old = likelihood
 
@@ -502,7 +509,7 @@ class GTM:
         self.omega = omega_optimized.reshape((self.location_count, self.topic_count))
 
     def df_psi2(self, psi2):
-        term1 = 0.5 * np.diagonal(self.sigma_inv, axis1=1, axis2=2)
+        term1 = 0.5 * np.diagonal(self.sigma_inv, axis1=1, axis2=2) * self.location_document_count[:, np.newaxis]
         term2 = 0.5 * np.diag(self.weight_matrix_inv)
 
         psi2_d = - (term1 + term2[:, np.newaxis])
@@ -525,11 +532,7 @@ class GTM:
         log_x = np.log(x)
         df1 = np.ones_like(x)
 
-        while np.all(np.abs(df1) > 0.0001):
-            if np.any(np.isnan(x)):
-                init_x *= 10
-                x = init_x
-                log_x = np.log(x)
+        while True:
             x = np.exp(log_x)
 
             df1 = g(x)
@@ -537,30 +540,157 @@ class GTM:
 
             log_x -= (x * df1) / (x * x * df2 + x * df1)
 
+            # Check for convergence and NaN handling
+            if np.all(np.abs(df1) <= 0.0001):
+                break
+            if np.any(np.isnan(x)):
+                init_x *= 10
+                log_x = np.log(init_x)
+
         self.psi2 = np.exp(log_x)
+
+    def maximize_W(self):
+        # Maximize W
+        term1 = np.diag(np.sum(self.psi2, axis=-1))
+        term2 = 0
+        for topic_index in range(self.topic_count):
+            omega = self.omega[:, topic_index]
+            omega_minus_m = omega - self.m
+            term2 += np.outer(omega_minus_m, omega_minus_m)
+        self.weight_matrix = (term1 + term2) / self.location_count
+        self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
+        self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
 
     def maximization(self):
         self.m = np.sum(self.omega, axis=-1) / self.topic_count
+        print(self.ELBO())
 
         self.sigma = maximize_sigmas(self.lam, self.nu2, self.omega, self.locations)
         self.sigma_inv = np.linalg.inv(self.sigma)
         self.sigma_inv_det = np.linalg.det(self.sigma_inv)
+        print(self.ELBO())
+
+        self.maximize_W()
+        print(self.ELBO())
 
         self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
+        print(self.ELBO())
 
     def save(self, path):
-        np.savez(
-            path,
+        # Convert numba list to python list
+        phis = list(self.phi)
 
-        )
+        obj = {
+            'topic_count': self.topic_count,
+            'vocab_size': self.vocab_size,
+            'location_count': self.location_count,
+            'weight_matrix': self.weight_matrix,
+            'm': self.m,
+            'sigma': self.sigma,
+            'beta': self.beta,
+
+            'phi': phis,
+            'zeta': self.zeta,
+            'lam': self.lam,
+            'nu2': self.nu2,
+            'omega': self.omega,
+            'psi2': self.psi2,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(obj, f)
 
     def load(self, path):
-        data = np.load(path)
-        self.beta = data['arr_0']
-        self.m = data['arr_1']
-        self.sigma = data['arr_2']
-        self.omega = data['arr_3']
-        self.psi2 = data['arr_4']
+        with open(path, 'rb') as f:
+            obj = pickle.load(f)
+            self.topic_count = obj['topic_count']
+            self.vocab_size = obj['vocab_size']
+            self.location_count = obj['location_count']
+            self.weight_matrix = obj['weight_matrix']
+            self.m = obj['m']
+            self.sigma = obj['sigma']
+            self.beta = obj['beta']
+
+            self.phi = obj['phi']
+            self.zeta = obj['zeta']
+            self.lam = obj['lam']
+            self.nu2 = obj['nu2']
+            self.omega = obj['omega']
+            self.psi2 = obj['psi2']
+
+            self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
+            self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
+            self.sigma_inv = np.linalg.inv(self.sigma)
+            self.sigma_inv_det = np.linalg.det(self.sigma_inv)
+
+            # Convert python list to numba list
+            # phis = typed.List.empty_list(types.float64[:, ::1])
+
+    def print_topics(self, dictionary, topn=10):
+        for topic_index in range(self.topic_count):
+            print('Topic ', topic_index)
+            topic = self.beta[topic_index]
+            top_words = topic.argsort()[-topn:][::-1]
+            for word_index in top_words:
+                print(dictionary[word_index], topic[word_index])
+
+    def get_lam_exp_norm(self):
+        lam_exp = np.exp(self.lam)
+        lam_exp_sum = np.sum(lam_exp, axis=1)
+        lam_exp_norm = lam_exp / lam_exp_sum[:, np.newaxis]
+
+        return lam_exp_norm
+
+    def get_omega_exp_norm(self):
+        omega_exp = np.exp(self.omega)
+        omega_exp_sum = np.sum(omega_exp, axis=1)
+        omega_exp_norm = omega_exp / omega_exp_sum[:, np.newaxis]
+
+        return omega_exp_norm
+
+    def topic_distribution(self):
+        return self.get_lam_exp_norm().sum(axis=0)
+
+    def location_distribution(self):
+        result = np.zeros((self.location_count, self.topic_count))
+        lam_exp_norm = self.get_lam_exp_norm()
+        for i in range(self.document_size):
+            result[self.locations[i]] += lam_exp_norm[i]
+
+        return result
+
+    def location_distribution_similarity(self):
+        distribution = self.location_distribution()
+        dis_norm = distribution / distribution.sum(axis=1)[:, np.newaxis]
+
+        similarity = np.zeros((self.location_count, self.location_count))
+        for i in range(self.location_count):
+            for j in range(self.location_count):
+                similarity[i, j] = cos_sim(dis_norm[i], dis_norm[j])
+
+        return similarity
+
+    def omega_exp_norm_JS_divergence(self):
+        omega_exp_norm = self.get_omega_exp_norm()
+
+        divergence = np.zeros((self.location_count, self.location_count))
+        for i in range(self.location_count):
+            for j in range(self.location_count):
+                divergence[i, j] = JS_divergence(omega_exp_norm[i], omega_exp_norm[j])
+
+        return divergence
+
+
+def cos_sim(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+
+def JS_divergence(p, q):
+    m = (p + q) / 2
+    return 0.5 * (entropy(p, m) + entropy(q, m))
+
+
+def entropy(p, q):
+    return np.sum(p * np.log(p / q))
 
 
 def main():
