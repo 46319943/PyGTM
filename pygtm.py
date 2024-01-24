@@ -1,15 +1,18 @@
 import json
 import pickle
+import time
 
+import numba
 import numpy as np
 from gensim.corpora import Dictionary
-from numba import njit, prange
+from numba import njit, prange, threading_layer
 from numba import types, typed
 from numpy.linalg import det
 from scipy.optimize import minimize
 from scipy.spatial.distance import pdist, squareform
 
 np.random.seed(10)
+numba.config.THREADING_LAYER = 'omp'
 
 
 @njit(parallel=True)
@@ -63,6 +66,7 @@ def log_p_z(phis, zetas, lams, nu2s):
 
 
 @njit(parallel=True)
+# @njit(parallel=False)
 def log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations):
     D = len(lams)
     T = lams.shape[1]
@@ -115,13 +119,14 @@ def log_p_mu(weight_matrix_inv, weight_matrix_inv_det, omegas, psi2s, m):
 def ELBO(
         log_beta, m, sigma_invs, weight_matrix_inv, weight_matrix_inv_det,
         phis, zetas, lams, nu2s, omegas, psi2s, locations, corpus):
-    return (
-            log_p_w(log_beta, phis, corpus) +
-            log_p_z(phis, zetas, lams, nu2s) +
-            log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations) +
-            log_p_mu(weight_matrix_inv, weight_matrix_inv_det, omegas, psi2s, m) +
-            entropy_phi(phis) + entropy_nu2(nu2s) + entropy_psi2(psi2s)
-    )
+    elbo = 0
+    elbo = elbo + log_p_w(log_beta, phis, corpus)
+    elbo = elbo + log_p_z(phis, zetas, lams, nu2s)
+    elbo = elbo + log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations)
+    elbo = elbo + log_p_mu(weight_matrix_inv, weight_matrix_inv_det, omegas, psi2s, m)
+    elbo = elbo + entropy_phi(phis) + entropy_nu2(nu2s) + entropy_psi2(psi2s)
+
+    return elbo
 
 
 @njit(parallel=True)
@@ -270,7 +275,7 @@ def opt_nu2(sigma_invs, zetas, lams, locations, word_counts):
 
 
 @njit(parallel=True)
-def maximize_sigmas(lams, nu2s, omegas, locations):
+def maximize_sigmas(lams, nu2s, omegas, psi2s ,locations):
     location_count = len(omegas)
     topic_count = lams.shape[1]
 
@@ -294,7 +299,9 @@ def maximize_sigmas(lams, nu2s, omegas, locations):
             lam_minus_omega = lam - omega
             term2 += np.outer(lam_minus_omega, lam_minus_omega)
 
-        sigmas[location_index] = (term1 + term2) / N
+        term3 = np.diag(psi2s[location_index])
+
+        sigmas[location_index] = (term1 + term2) / N + term3
 
     return sigmas
 
@@ -325,7 +332,7 @@ def maximize_beta(phis, corpus, vocab_size):
 
 
 class GTM:
-    def __init__(self, topic_count, vocab_size, location_count, weight_matrix):
+    def __init__(self, topic_count, vocab_size, location_count, weight_matrix, variational_rate=1e-3, em_rate=1e-3):
         # Model Property
         self.topic_count = topic_count
         self.vocab_size = vocab_size
@@ -356,6 +363,13 @@ class GTM:
         self.nu2 = None
         self.omega = None
         self.psi2 = None
+
+        # Training hyperparameter
+        self.variational_rate = variational_rate
+        self.em_rate = em_rate
+
+        # Timer
+        self.last_time = None
 
         self.init_model_param()
 
@@ -391,10 +405,21 @@ class GTM:
             )
 
     def ELBO(self):
-        return ELBO(
+        elbo = ELBO(
             self.log_beta, self.m, self.sigma_inv, self.weight_matrix_inv, self.weight_matrix_inv_det,
             self.phi, self.zeta, self.lam, self.nu2, self.omega, self.psi2, self.locations, self.corpus
         )
+        print(elbo, self.get_interval())
+        return elbo
+
+    def get_interval(self):
+        if self.last_time is None:
+            self.last_time = time.time()
+            return 0
+
+        interval = time.time() - self.last_time
+        self.last_time = time.time()
+        return interval
 
     def train(self, corpus, locations, max_iter=1000):
         self.corpus = corpus
@@ -404,7 +429,10 @@ class GTM:
         self.location_document_count = np.array([np.sum(locations == i) for i in range(self.location_count)])
         self.init_variational_factor()
 
+        self.get_interval()
         after = self.ELBO()
+        print('lhood = ', after)
+        print(threading_layer())
 
         for _ in range(max_iter):
             before = after
@@ -415,32 +443,41 @@ class GTM:
 
             print('lhood = ', after)
             print(((before - after) / before))
-            if ((before - after) / before) < 1e-4:
+            if ((before - after) / before) < self.em_rate:
                 break
+
+        return after
 
     def expectation(self, max_iter=50):
         likelihood_old = self.ELBO()
 
         self.opt_psi2()
-        print(self.ELBO())
+        print('psi2', self.get_interval())
+        self.ELBO()
 
         for i in range(max_iter):
             self.opt_zeta()
             self.phi = opt_phi(self.log_beta, self.lam, self.corpus)
-            print(self.ELBO())
+            print('phi', self.get_interval())
+            self.ELBO()
+
             self.opt_zeta()
             self.opt_lam()
-            print(self.ELBO())
+            print('lam', self.get_interval())
+            self.ELBO()
+
             self.opt_zeta()
             self.nu2 = opt_nu2(self.sigma_inv, self.zeta, self.lam, self.locations, self.word_counts)
-            print(self.ELBO())
+            print('nu2', self.get_interval())
+            self.ELBO()
+
             self.opt_zeta()
 
             self.opt_omega()
-            print(self.ELBO())
+            print('omega', self.get_interval())
 
             likelihood = self.ELBO()
-            if ((likelihood_old - likelihood) / likelihood_old) < 1e-3:
+            if ((likelihood_old - likelihood) / likelihood_old) < self.variational_rate:
                 break
             likelihood_old = likelihood
 
@@ -503,6 +540,7 @@ class GTM:
         fn = lambda x: - self.ELBO_omega(x.reshape((self.location_count, self.topic_count)))
         g = lambda x: - self.df_omega(x.reshape((self.location_count, self.topic_count))).flatten()
 
+        # TODO: Try other methods. As the current method is too slow.
         res = minimize(fn, x0=omega, jac=g, method='Newton-CG', options={'disp': 0})
         omega_optimized = res.x
 
@@ -532,6 +570,8 @@ class GTM:
         log_x = np.log(x)
         df1 = np.ones_like(x)
 
+        last_two_df1 = []
+
         while True:
             x = np.exp(log_x)
 
@@ -540,8 +580,16 @@ class GTM:
 
             log_x -= (x * df1) / (x * x * df2 + x * df1)
 
+            if len(last_two_df1) == 2:
+                if np.all(df1 == last_two_df1[0]) or np.all(df1 == last_two_df1[1]):
+                    break
+
+            last_two_df1.append(df1)
+            if len(last_two_df1) > 2:
+                last_two_df1.pop(0)
+
             # Check for convergence and NaN handling
-            if np.all(np.abs(df1) <= 0.0001):
+            if np.all(np.abs(df1) <= 0.001):
                 break
             if np.any(np.isnan(x)):
                 init_x *= 10
@@ -557,24 +605,28 @@ class GTM:
             omega = self.omega[:, topic_index]
             omega_minus_m = omega - self.m
             term2 += np.outer(omega_minus_m, omega_minus_m)
-        self.weight_matrix = (term1 + term2) / self.location_count
+        self.weight_matrix = (term1 + term2) / self.topic_count
         self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
         self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
 
     def maximization(self):
         self.m = np.sum(self.omega, axis=-1) / self.topic_count
-        print(self.ELBO())
+        print('m', self.get_interval())
+        self.ELBO()
 
-        self.sigma = maximize_sigmas(self.lam, self.nu2, self.omega, self.locations)
+        self.sigma = maximize_sigmas(self.lam, self.nu2, self.omega, self.psi2, self.locations)
         self.sigma_inv = np.linalg.inv(self.sigma)
         self.sigma_inv_det = np.linalg.det(self.sigma_inv)
-        print(self.ELBO())
+        print('sigma', self.get_interval())
+        self.ELBO()
 
         self.maximize_W()
-        print(self.ELBO())
+        print('W', self.get_interval())
+        self.ELBO()
 
         self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
-        print(self.ELBO())
+        print('beta', self.get_interval())
+        self.ELBO()
 
     def save(self, path):
         # Convert numba list to python list
@@ -599,39 +651,52 @@ class GTM:
         with open(path, 'wb') as f:
             pickle.dump(obj, f)
 
-    def load(self, path):
+    @classmethod
+    def load(cls, path):
+
         with open(path, 'rb') as f:
             obj = pickle.load(f)
-            self.topic_count = obj['topic_count']
-            self.vocab_size = obj['vocab_size']
-            self.location_count = obj['location_count']
-            self.weight_matrix = obj['weight_matrix']
-            self.m = obj['m']
-            self.sigma = obj['sigma']
-            self.beta = obj['beta']
+            topic_count = obj['topic_count']
+            vocab_size = obj['vocab_size']
+            location_count = obj['location_count']
+            weight_matrix = obj['weight_matrix']
 
-            self.phi = obj['phi']
-            self.zeta = obj['zeta']
-            self.lam = obj['lam']
-            self.nu2 = obj['nu2']
-            self.omega = obj['omega']
-            self.psi2 = obj['psi2']
+            gtm = cls(topic_count, vocab_size, location_count, weight_matrix)
 
-            self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
-            self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
-            self.sigma_inv = np.linalg.inv(self.sigma)
-            self.sigma_inv_det = np.linalg.det(self.sigma_inv)
+            gtm.m = obj['m']
+            gtm.sigma = obj['sigma']
+            gtm.beta = obj['beta']
+
+            gtm.phi = obj['phi']
+            gtm.zeta = obj['zeta']
+            gtm.lam = obj['lam']
+            gtm.nu2 = obj['nu2']
+            gtm.omega = obj['omega']
+            gtm.psi2 = obj['psi2']
+
+            gtm.weight_matrix_inv = np.linalg.inv(gtm.weight_matrix)
+            gtm.weight_matrix_inv_det = np.linalg.det(gtm.weight_matrix_inv)
+            gtm.sigma_inv = np.linalg.inv(gtm.sigma)
+            gtm.sigma_inv_det = np.linalg.det(gtm.sigma_inv)
 
             # Convert python list to numba list
             # phis = typed.List.empty_list(types.float64[:, ::1])
 
+        return gtm
+
     def print_topics(self, dictionary, topn=10):
+        topics = []
         for topic_index in range(self.topic_count):
+            word_prob_pairs = []
             print('Topic ', topic_index)
-            topic = self.beta[topic_index]
-            top_words = topic.argsort()[-topn:][::-1]
-            for word_index in top_words:
-                print(dictionary[word_index], topic[word_index])
+            topic_beta = self.beta[topic_index]
+            top_words_indices = topic_beta.argsort()[-topn:][::-1]
+            for word_index in top_words_indices:
+                print(dictionary[word_index], topic_beta[word_index])
+                word_prob_pairs.append((dictionary[word_index], topic_beta[word_index]))
+            topics.append(word_prob_pairs)
+        return topics
+
 
     def get_lam_exp_norm(self):
         lam_exp = np.exp(self.lam)
