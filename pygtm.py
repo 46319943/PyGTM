@@ -12,7 +12,7 @@ from scipy.optimize import minimize
 from scipy.spatial.distance import pdist, squareform
 
 np.random.seed(10)
-numba.config.THREADING_LAYER = 'omp'
+# numba.config.THREADING_LAYER = 'omp'
 
 
 @njit(parallel=True)
@@ -65,8 +65,8 @@ def log_p_z(phis, zetas, lams, nu2s):
     return value
 
 
-@njit(parallel=True)
-# @njit(parallel=False)
+# @njit(parallel=True)
+@njit(parallel=False)
 def log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations):
     D = len(lams)
     T = lams.shape[1]
@@ -449,37 +449,45 @@ class GTM:
         return after
 
     def expectation(self, max_iter=50):
-        likelihood_old = self.ELBO()
+        likelihood_outer_old = self.ELBO()
 
-        self.opt_psi2()
-        print('psi2', self.get_interval())
-        self.ELBO()
+        for j in range(max_iter):
 
-        for i in range(max_iter):
-            self.opt_zeta()
-            self.phi = opt_phi(self.log_beta, self.lam, self.corpus)
-            print('phi', self.get_interval())
-            self.ELBO()
+            likelihood_old = self.ELBO()
+            for i in range(max_iter):
+                self.opt_zeta()
+                self.phi = opt_phi(self.log_beta, self.lam, self.corpus)
+                print('phi', self.get_interval())
+                self.ELBO()
 
-            self.opt_zeta()
-            self.opt_lam()
-            print('lam', self.get_interval())
-            self.ELBO()
+                self.opt_zeta()
+                self.opt_lam()
+                print('lam', self.get_interval())
+                self.ELBO()
 
-            self.opt_zeta()
-            self.nu2 = opt_nu2(self.sigma_inv, self.zeta, self.lam, self.locations, self.word_counts)
-            print('nu2', self.get_interval())
-            self.ELBO()
+                self.opt_zeta()
+                self.nu2 = opt_nu2(self.sigma_inv, self.zeta, self.lam, self.locations, self.word_counts)
+                print('nu2', self.get_interval())
+                self.ELBO()
 
-            self.opt_zeta()
+                self.opt_zeta()
 
-            self.opt_omega()
-            print('omega', self.get_interval())
+                self.opt_omega()
+                print('omega', self.get_interval())
 
-            likelihood = self.ELBO()
-            if ((likelihood_old - likelihood) / likelihood_old) < self.variational_rate:
+                likelihood = self.ELBO()
+                if ((likelihood_old - likelihood) / likelihood_old) < self.variational_rate:
+                    break
+                likelihood_old = likelihood
+
+            self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
+            print('beta', self.get_interval())
+            likelihood_outer = self.ELBO()
+
+            if ((likelihood_outer_old - likelihood_outer) / likelihood_outer_old) < self.variational_rate:
                 break
-            likelihood_old = likelihood
+            likelihood_outer_old = likelihood_outer
+
 
     def opt_zeta(self):
         self.zeta = np.sum(np.exp(self.lam + self.nu2 / 2), axis=-1)
@@ -606,6 +614,7 @@ class GTM:
             omega_minus_m = omega - self.m
             term2 += np.outer(omega_minus_m, omega_minus_m)
         self.weight_matrix = (term1 + term2) / self.topic_count
+        # self.weight_matrix = (term1 + term2) / self.location_count
         self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
         self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
 
@@ -618,6 +627,10 @@ class GTM:
         self.sigma_inv = np.linalg.inv(self.sigma)
         self.sigma_inv_det = np.linalg.det(self.sigma_inv)
         print('sigma', self.get_interval())
+        self.ELBO()
+
+        self.opt_psi2()
+        print('psi2', self.get_interval())
         self.ELBO()
 
         self.maximize_W()
@@ -787,7 +800,7 @@ def main():
     weight_matrix = np.exp(-distance_matrix ** 2)
 
     # Initialize the GTM model
-    gtm = GTM(10, len(dictionary), location_count, np.float64(weight_matrix))
+    gtm = GTM(30, len(dictionary), location_count, np.float64(weight_matrix))
 
     corpus_input = typed.List.empty_list(types.int32[::1])
     for doc in corpus:
@@ -795,6 +808,8 @@ def main():
 
     # Train the GTM model
     gtm.train(corpus_input, locations)
+
+    print()
 
 
 if __name__ == '__main__':
