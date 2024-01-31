@@ -800,7 +800,10 @@ def main():
     weight_matrix = np.exp(-distance_matrix ** 2)
 
     # Initialize the GTM model
-    gtm = GTM(30, len(dictionary), location_count, np.float64(weight_matrix))
+    gtm = GTM(
+        30, len(dictionary), location_count, np.float64(weight_matrix),
+        variational_rate=1e-3, em_rate=1e-4
+    )
 
     corpus_input = typed.List.empty_list(types.int32[::1])
     for doc in corpus:
