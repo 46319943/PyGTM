@@ -275,7 +275,7 @@ def opt_nu2(sigma_invs, zetas, lams, locations, word_counts):
 
 
 @njit(parallel=True)
-def maximize_sigmas(lams, nu2s, omegas, psi2s ,locations):
+def maximize_sigmas(lams, nu2s, omegas, psi2s, locations):
     location_count = len(omegas)
     topic_count = lams.shape[1]
 
@@ -697,7 +697,6 @@ class GTM:
             topics.append(word_prob_pairs)
         return topics
 
-
     def get_lam_exp_norm(self):
         lam_exp = np.exp(self.lam)
         lam_exp_sum = np.sum(lam_exp, axis=1)
@@ -743,6 +742,44 @@ class GTM:
                 divergence[i, j] = JS_divergence(omega_exp_norm[i], omega_exp_norm[j])
 
         return divergence
+
+    def sigma_correlation(self):
+        sigma_correlation = np.zeros((self.location_count, self.topic_count, self.topic_count))
+        for location_index in range(self.location_count):
+            sigma_correlation[location_index] = correlation_from_covariance(self.sigma[location_index])
+
+        return sigma_correlation
+
+    def sigma_partial_correlation(self):
+        sigma_partial_correlation = np.zeros((self.location_count, self.topic_count, self.topic_count))
+        for location_index in range(self.location_count):
+            sigma_partial_correlation[location_index] = partial_correlation_from_precision(self.sigma_inv[location_index])
+
+        return sigma_partial_correlation
+
+    def weight_correlation(self):
+        weight_correlation = correlation_from_covariance(self.weight_matrix)
+        return weight_correlation
+
+    def weight_partial_correlation(self):
+        weight_partial_correlation = partial_correlation_from_precision(self.weight_matrix_inv)
+        return weight_partial_correlation
+
+
+def correlation_from_covariance(covariance):
+    correlation = np.zeros_like(covariance)
+    for i in range(covariance.shape[0]):
+        for j in range(covariance.shape[1]):
+            correlation[i, j] = covariance[i, j] / np.sqrt(covariance[i, i] * covariance[j, j])
+    return correlation
+
+
+def partial_correlation_from_precision(precision):
+    partial_correlation = np.zeros_like(precision)
+    for i in range(precision.shape[0]):
+        for j in range(precision.shape[1]):
+            partial_correlation[i, j] = -precision[i, j] / np.sqrt(precision[i, i] * precision[j, j])
+    return partial_correlation
 
 
 def cos_sim(a, b):
