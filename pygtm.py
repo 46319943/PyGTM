@@ -2,7 +2,6 @@ import json
 import pickle
 import time
 
-import numba
 import numpy as np
 from gensim.corpora import Dictionary
 from numba import njit, prange, threading_layer
@@ -12,6 +11,8 @@ from scipy.optimize import minimize
 from scipy.spatial.distance import pdist, squareform
 
 np.random.seed(10)
+
+
 # numba.config.THREADING_LAYER = 'omp'
 
 
@@ -275,7 +276,7 @@ def opt_nu2(sigma_invs, zetas, lams, locations, word_counts):
 
 
 @njit(parallel=True)
-def maximize_sigmas(lams, nu2s, omegas, psi2s ,locations):
+def maximize_sigmas(lams, nu2s, omegas, psi2s, locations):
     location_count = len(omegas)
     topic_count = lams.shape[1]
 
@@ -434,10 +435,10 @@ class GTM:
         print('lhood = ', after)
         print(threading_layer())
 
-        for _ in range(max_iter):
+        for i_iter in range(max_iter):
             before = after
             self.expectation()
-            self.maximization()
+            self.maximization(i_iter)
 
             after = self.ELBO()
 
@@ -487,7 +488,6 @@ class GTM:
             if ((likelihood_outer_old - likelihood_outer) / likelihood_outer_old) < self.variational_rate:
                 break
             likelihood_outer_old = likelihood_outer
-
 
     def opt_zeta(self):
         self.zeta = np.sum(np.exp(self.lam + self.nu2 / 2), axis=-1)
@@ -618,7 +618,7 @@ class GTM:
         self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
         self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
 
-    def maximization(self):
+    def maximization(self, iter):
         self.m = np.sum(self.omega, axis=-1) / self.topic_count
         print('m', self.get_interval())
         self.ELBO()
@@ -633,9 +633,10 @@ class GTM:
         print('psi2', self.get_interval())
         self.ELBO()
 
-        self.maximize_W()
-        print('W', self.get_interval())
-        self.ELBO()
+        if iter >= 2:
+            self.maximize_W()
+            print('W', self.get_interval())
+            self.ELBO()
 
         self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
         print('beta', self.get_interval())
@@ -709,7 +710,6 @@ class GTM:
                 word_prob_pairs.append((dictionary[word_index], topic_beta[word_index]))
             topics.append(word_prob_pairs)
         return topics
-
 
     def get_lam_exp_norm(self):
         lam_exp = np.exp(self.lam)
