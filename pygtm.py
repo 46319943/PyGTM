@@ -434,10 +434,10 @@ class GTM:
         print('lhood = ', after)
         print(threading_layer())
 
-        for _ in range(max_iter):
+        for i_iter in range(max_iter):
             before = after
             self.expectation()
-            self.maximization()
+            self.maximization(i_iter)
 
             after = self.ELBO()
 
@@ -609,7 +609,7 @@ class GTM:
         self.weight_matrix_inv = np.linalg.inv(self.weight_matrix)
         self.weight_matrix_inv_det = np.linalg.det(self.weight_matrix_inv)
 
-    def maximization(self):
+    def maximization(self, i_iter):
         self.m = np.sum(self.omega, axis=-1) / self.topic_count
         print('m', self.get_interval())
         self.ELBO()
@@ -620,9 +620,10 @@ class GTM:
         print('sigma', self.get_interval())
         self.ELBO()
 
-        self.maximize_W()
-        print('W', self.get_interval())
-        self.ELBO()
+        if i_iter >= 10:
+            self.maximize_W()
+            print('W', self.get_interval())
+            self.ELBO()
 
         self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
         print('beta', self.get_interval())
@@ -787,7 +788,7 @@ def main():
     weight_matrix = np.exp(-distance_matrix ** 2)
 
     # Initialize the GTM model
-    gtm = GTM(10, len(dictionary), location_count, np.float64(weight_matrix))
+    gtm = GTM(30, len(dictionary), location_count, np.float64(weight_matrix))
 
     corpus_input = typed.List.empty_list(types.int32[::1])
     for doc in corpus:
