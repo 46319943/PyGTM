@@ -15,7 +15,6 @@ np.random.seed(10)
 
 # numba.config.THREADING_LAYER = 'omp'
 
-
 @njit(parallel=True)
 def entropy_phi(phis):
     D = len(phis)
@@ -450,10 +449,7 @@ class GTM:
         return after
 
     def expectation(self, max_iter=50):
-        likelihood_outer_old = self.ELBO()
-
         for j in range(max_iter):
-
             likelihood_old = self.ELBO()
             for i in range(max_iter):
                 self.opt_zeta()
@@ -481,13 +477,12 @@ class GTM:
                     break
                 likelihood_old = likelihood
 
+            likelihood_before_beta = self.ELBO()
             self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
             print('beta', self.get_interval())
-            likelihood_outer = self.ELBO()
-
-            if ((likelihood_outer_old - likelihood_outer) / likelihood_outer_old) < self.variational_rate:
+            likelihood_after_beta = self.ELBO()
+            if ((likelihood_before_beta - likelihood_after_beta) / likelihood_before_beta) < self.variational_rate:
                 break
-            likelihood_outer_old = likelihood_outer
 
     def opt_zeta(self):
         self.zeta = np.sum(np.exp(self.lam + self.nu2 / 2), axis=-1)
@@ -637,10 +632,6 @@ class GTM:
             self.maximize_W()
             print('W', self.get_interval())
             self.ELBO()
-
-        self.beta, self.log_beta = maximize_beta(self.phi, self.corpus, self.vocab_size)
-        print('beta', self.get_interval())
-        self.ELBO()
 
     def save(self, path):
         # Convert numba list to python list
