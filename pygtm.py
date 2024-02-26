@@ -1,19 +1,49 @@
-import json
 import pickle
 import time
 
+import numba
 import numpy as np
-from gensim.corpora import Dictionary
 from numba import njit, prange, threading_layer
 from numba import types, typed
 from numpy.linalg import det
 from scipy.optimize import minimize
-from scipy.spatial.distance import pdist, squareform
+import platform
 
 np.random.seed(10)
 
+OPERATING_SYSTEM = platform.system()
 
-# numba.config.THREADING_LAYER = 'omp'
+if OPERATING_SYSTEM == 'Windows':
+    numba.config.THREADING_LAYER = 'tbb'
+else:
+    numba.config.THREADING_LAYER = 'omp'
+
+
+@njit(parallel=True if OPERATING_SYSTEM == 'Linux' else False)
+def log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations):
+    D = len(lams)
+    T = lams.shape[1]
+
+    value = 0
+    for document_index in prange(D):
+        sigma_inv = sigma_invs[locations[document_index]]
+        lam = lams[document_index]
+        omega = omegas[locations[document_index]]
+        nu2 = nu2s[document_index]
+        psi2 = psi2s[locations[document_index]]
+
+        term1 = 0.5 * np.log(det(sigma_inv))
+        term2 = 0.5 * T * np.log(2 * np.pi)
+        term3 = 0.5 * (
+                np.trace(np.dot(np.diag(nu2), sigma_inv)) +
+                np.trace(np.dot(np.diag(psi2), sigma_inv)) +
+                np.dot(np.dot((lam - omega).T, sigma_inv), lam - omega)
+        )
+
+        value += term1 - term2 - term3
+
+    return value
+
 
 @njit(parallel=True)
 def entropy_phi(phis):
@@ -62,33 +92,6 @@ def log_p_z(phis, zetas, lams, nu2s):
         term2 = - word_count * (1 / zeta) * sum(np.exp(lam + nu2 / 2))
         term3 = word_count * (1 - np.log(zeta))
         value += term1 + term2 + term3
-    return value
-
-
-# @njit(parallel=True)
-@njit(parallel=False)
-def log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations):
-    D = len(lams)
-    T = lams.shape[1]
-
-    value = 0
-    for document_index in prange(D):
-        sigma_inv = sigma_invs[locations[document_index]]
-        lam = lams[document_index]
-        omega = omegas[locations[document_index]]
-        nu2 = nu2s[document_index]
-        psi2 = psi2s[locations[document_index]]
-
-        term1 = 0.5 * np.log(det(sigma_inv))
-        term2 = 0.5 * T * np.log(2 * np.pi)
-        term3 = 0.5 * (
-                np.trace(np.dot(np.diag(nu2), sigma_inv)) +
-                np.trace(np.dot(np.diag(psi2), sigma_inv)) +
-                np.dot(np.dot((lam - omega).T, sigma_inv), lam - omega)
-        )
-
-        value += term1 - term2 - term3
-
     return value
 
 
@@ -421,13 +424,18 @@ class GTM:
         self.last_time = time.time()
         return interval
 
-    def train(self, corpus, locations, max_iter=1000):
-        self.corpus = corpus
-        self.locations = locations
-        self.document_size = len(corpus)
-        self.word_counts = np.array([len(doc) for doc in corpus])
-        self.location_document_count = np.array([np.sum(locations == i) for i in range(self.location_count)])
-        self.init_variational_factor()
+    def train(self, corpus=None, locations=None, max_iter=1000):
+        continue_train = False
+        if corpus is None and locations is None:
+            continue_train = True
+
+        if not continue_train:
+            self.corpus = corpus
+            self.locations = locations
+            self.document_size = len(corpus)
+            self.word_counts = np.array([len(doc) for doc in corpus])
+            self.location_document_count = np.array([np.sum(locations == i) for i in range(self.location_count)])
+            self.init_variational_factor()
 
         self.get_interval()
         after = self.ELBO()
@@ -636,6 +644,7 @@ class GTM:
     def save(self, path):
         # Convert numba list to python list
         phis = list(self.phi)
+        corpus = list(self.corpus)
 
         obj = {
             'topic_count': self.topic_count,
@@ -652,6 +661,12 @@ class GTM:
             'nu2': self.nu2,
             'omega': self.omega,
             'psi2': self.psi2,
+
+            'corpus': corpus,
+            'locations': self.locations,
+            'document_size': self.document_size,
+            'word_counts': self.word_counts,
+            'location_document_count': self.location_document_count
         }
         with open(path, 'wb') as f:
             pickle.dump(obj, f)
@@ -679,13 +694,29 @@ class GTM:
             gtm.omega = obj['omega']
             gtm.psi2 = obj['psi2']
 
+            gtm.corpus = obj['corpus']
+            gtm.locations = obj['locations']
+            gtm.document_size = obj['document_size']
+            gtm.word_counts = obj['word_counts']
+            gtm.location_document_count = obj['location_document_count']
+
             gtm.weight_matrix_inv = np.linalg.inv(gtm.weight_matrix)
             gtm.weight_matrix_inv_det = np.linalg.det(gtm.weight_matrix_inv)
             gtm.sigma_inv = np.linalg.inv(gtm.sigma)
             gtm.sigma_inv_det = np.linalg.det(gtm.sigma_inv)
 
             # Convert python list to numba list
-            # phis = typed.List.empty_list(types.float64[:, ::1])
+            phis = typed.List.empty_list(types.float64[:, ::1])
+            for phi in gtm.phi:
+                phis.append(phi)
+
+            gtm.phi = phis
+
+            corpus = typed.List.empty_list(types.int32[::1])
+            for doc in gtm.corpus:
+                corpus.append(np.array(doc))
+
+            gtm.corpus = corpus
 
         return gtm
 
@@ -798,51 +829,3 @@ def JS_divergence(p, q):
 
 def entropy(p, q):
     return np.sum(p * np.log(p / q))
-
-
-def main():
-    # Load the "suzhou_sense_for_gtm.json"
-    documents = json.load(open('suzhou_sense_for_gtm.json', 'r', encoding='UTF-8'))
-
-    # Create a dictionary from the documents
-    dictionary = Dictionary(documents)
-    dictionary.save_as_text('dictionary.txt')
-
-    # Create a corpus from the documents
-    corpus = [dictionary.doc2idx(doc) for doc in documents]
-
-    # Save the corpus
-    dictionary.save_as_text('corpus.txt')
-
-    location_count = 5
-
-    # Generate a random location for each document
-    locations = np.random.randint(0, location_count, len(documents))
-
-    # Generate a random coordinate for each location
-    coords = np.random.uniform(0, 1, (location_count, 2))
-
-    # Calculate the distance matrix using the coordinates and pdist
-    distance_matrix = squareform(pdist(coords))
-
-    # Calculate the weight matrix using the distance matrix and gaussian kernel
-    weight_matrix = np.exp(-distance_matrix ** 2)
-
-    # Initialize the GTM model
-    gtm = GTM(
-        30, len(dictionary), location_count, np.float64(weight_matrix),
-        variational_rate=1e-3, em_rate=1e-4
-    )
-
-    corpus_input = typed.List.empty_list(types.int32[::1])
-    for doc in corpus:
-        corpus_input.append(np.array(doc))
-
-    # Train the GTM model
-    gtm.train(corpus_input, locations)
-
-    print()
-
-
-if __name__ == '__main__':
-    main()
