@@ -44,7 +44,6 @@ def log_p_eta(sigma_invs, lams, nu2s, psi2s, omegas, locations):
 
     return value
 
-
 @njit(parallel=True)
 def entropy_phi(phis):
     D = len(phis)
